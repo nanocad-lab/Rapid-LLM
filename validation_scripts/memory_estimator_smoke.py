@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# Copyright 2026 NanoCad lab, UCLA
+# https://nanocad.ee.ucla.edu/
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 
 import os
 import sys
@@ -29,9 +44,12 @@ INTERMEDIATE_SIZE: Optional[int] = None
 VOCAB_SIZE: Optional[int] = None
 TP: Optional[int] = None
 CP: Optional[int] = None
-LP: Optional[int] = None
+PP: Optional[int] = None
 DP: Optional[int] = None
+EP: Optional[int] = None
 MB: Optional[int] = None
+INFERENCE_REPLICA_COUNT: Optional[int] = None
+INFERENCE_MOE_DP: Optional[int] = None
 NUM_EXPERTS: Optional[int] = None
 TOP_K: Optional[int] = None
 
@@ -59,9 +77,12 @@ class SmokeConfig:
     vocab_size: Optional[int] = VOCAB_SIZE
     tp: Optional[int] = TP
     cp: Optional[int] = CP
-    lp: Optional[int] = LP
+    pp: Optional[int] = PP
     dp: Optional[int] = DP
+    ep: Optional[int] = EP
     mb: Optional[int] = MB
+    inference_replica_count: Optional[int] = INFERENCE_REPLICA_COUNT
+    inference_moe_dp: Optional[int] = INFERENCE_MOE_DP
     flash_attention: str = FLASH_ATTENTION
     full_recomputation: str = FULL_RECOMPUTATION
     attention_tile_size: int = ATTENTION_TILE_SIZE
@@ -106,15 +127,46 @@ def _apply_overrides(model_cfg, sched_cfg, cfg: SmokeConfig):
             _set_if_present(model_cfg, key, int(value))
 
     if cfg.num_experts is not None:
-        _set_if_present(model_cfg, "num_experts", int(cfg.num_experts))
+        moe_cfg = getattr(model_cfg, "moe", None)
+        if moe_cfg is not None:
+            moe_cfg.num_experts = int(cfg.num_experts)
     if cfg.top_k is not None:
-        _set_if_present(model_cfg, "top_k", int(cfg.top_k))
+        moe_cfg = getattr(model_cfg, "moe", None)
+        if moe_cfg is not None:
+            moe_cfg.top_k = int(cfg.top_k)
+    moe_cfg = getattr(model_cfg, "moe", None)
+    if moe_cfg is not None:
+        if getattr(model_cfg, "intermediate_size", None) is not None:
+            moe_cfg.moe_intermediate_size = int(getattr(model_cfg, "intermediate_size"))
+        moe_enabled = bool(
+            moe_cfg.num_experts > 1
+            or moe_cfg.top_k > 1
+            or getattr(moe_cfg, "n_shared_experts", 0) > 0
+        )
+        if moe_enabled:
+            moe_cfg.moe_layer_freq = 1
+            moe_cfg.first_k_dense_replace = 0
+        else:
+            moe_cfg.moe_layer_freq = 1
+            moe_cfg.first_k_dense_replace = int(getattr(model_cfg, "num_layers", 1))
 
     if sched_cfg is not None:
-        for key in ("dp", "tp", "cp", "lp", "mb"):
-            value = getattr(cfg, key)
+        for key in ("tp", "cp", "pp", "mb"):
+            value = getattr(cfg, key, None)
             if value is not None and hasattr(sched_cfg, key):
                 setattr(sched_cfg, key, int(value))
+        train_cfg = getattr(sched_cfg, "train", None)
+        if train_cfg is not None:
+            if cfg.dp is not None:
+                train_cfg.dp = int(cfg.dp)
+            if cfg.ep is not None:
+                train_cfg.ep = int(cfg.ep)
+        inference_cfg = getattr(sched_cfg, "inference", None)
+        if inference_cfg is not None:
+            if cfg.inference_replica_count is not None:
+                inference_cfg.replica_count = int(cfg.inference_replica_count)
+            if cfg.inference_moe_dp is not None:
+                inference_cfg.moe_dp = int(cfg.inference_moe_dp)
 
 
 def _configure_flash_attention(model_cfg, enabled: bool, tile_size: int) -> None:

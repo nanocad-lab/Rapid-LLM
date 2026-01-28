@@ -1,3 +1,18 @@
+# Copyright 2026 NanoCad lab, UCLA
+# https://nanocad.ee.ucla.edu/
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """AstraSim execution helpers used by RAPID-LLM's comparison workflow.
 
 This module converts RAPID-LLM graphs (with communication sizes) to AstraSim Chakra ET
@@ -263,6 +278,19 @@ def _assign_collective_labels(
     group_key_to_label: Dict[Tuple[str, Tuple[int, ...]], str] = {}
     label_suffix_counter: Dict[str, int] = defaultdict(int)
 
+    def _composite_members(stage: int, dp_idx: int, axes: Sequence[str]) -> List[int]:
+        coords = stage_axis_coords.get(stage, {})
+        key_base = tuple((ax, coords.get(ax, 0)) for ax in axis_order if ax not in axes)
+        members: List[int] = []
+        for stage_id, stage_coords in stage_axis_coords.items():
+            stage_key = tuple((ax, stage_coords.get(ax, 0)) for ax in axis_order if ax not in axes)
+            if stage_key != key_base:
+                continue
+            ranks = stage_to_ranks.get(stage_id, [])
+            if dp_idx < len(ranks):
+                members.append(ranks[dp_idx])
+        return sorted(set(members))
+
     for base_name, edges in tp_collective_groups.items():
         if not edges:
             continue
@@ -272,13 +300,24 @@ def _assign_collective_labels(
             stage = info["stage"]
             coords = stage_axis_coords.get(stage, {})
             key_base = tuple((ax, coords.get(ax, 0)) for ax in axis_order if ax != axis)
+            participants = int(info.get("participants", 0) or 0)
+
+            composite_axes: Optional[Tuple[str, ...]] = None
+            if axis == "ep":
+                tp_size = max(1, int(axis_sizes.get("tp", 1)))
+                ep_size = max(1, int(axis_sizes.get("ep", 1)))
+                if tp_size > 1 and participants == tp_size * ep_size:
+                    composite_axes = ("tp", "ep")
 
             members_per_dp: List[Tuple[int, Tuple[int, ...]]] = []
             for dp_idx in range(dp_count):
                 members = None
-                axis_map = axis_groups.get(axis)
-                if axis_map is not None:
-                    members = axis_map.get((dp_idx, key_base))
+                if composite_axes is not None:
+                    members = _composite_members(stage, dp_idx, composite_axes)
+                else:
+                    axis_map = axis_groups.get(axis)
+                    if axis_map is not None:
+                        members = axis_map.get((dp_idx, key_base))
                 if not members:
                     ranks = stage_to_ranks.get(stage, [])
                     if dp_idx < len(ranks):
@@ -773,7 +812,7 @@ def convert_rapid_llm_graph_to_chakra_et(
         duration_sec = getattr(task, "duration", 0.0) or 0.0
         return float(duration_sec)
 
-    # Step 3: Recover the multi-dimensional axis layout (tp/cp/lp, etc.) so that
+    # Step 3: Recover the multi-dimensional axis layout (tp/cp/pp, etc.) so that
     # communicator membership can be reconstructed deterministically later on.
     rank_layout = getattr(graph_root, "_astrasim_rank_layout", None)
     axis_order, axis_sizes, axis_strides = _extract_axis_layout(rank_layout)
@@ -1149,11 +1188,11 @@ def convert_rapid_llm_graph_to_chakra_et(
     if collector:
         _record_pipeline_edges_for_first_dim(collector)
     # Step 6: Group collectives by label/axis so we can reconstruct communicator
-    # memberships (tp/cp/lp) without relying on the original ordering.
+    # memberships (tp/cp/pp) without relying on the original ordering.
     tp_collective_groups: Dict[str, List[Any]] = defaultdict(list)
     for edge, info in collective_info.items():
         interconnect_type = info.get("interconnect_type")
-        if interconnect_type and interconnect_type not in {"dp", "lp", "pipeline"}:
+        if interconnect_type and interconnect_type not in {"dp", "pp", "pipeline"}:
             tp_collective_groups[info["name"]].append(edge)
 
     (

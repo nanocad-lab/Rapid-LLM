@@ -93,13 +93,20 @@ memory_hierarchy:
 
 parallelism:
   ### LLM PARAMS ###
-  dp: 1 # acts as replica count during inference
-  lp: 1 # pipeline stages
+  pp: 1 # pipeline stages
   mb: 1 # number of micro-batches
   tp: 1 # tensor parallelism
   tp_sp: false # tensor-sequence parallelism
   cp : 1 # context parallelism
 
+  train:
+    dp: 1 # data parallelism
+    ep: 1 # expert parallelism
+    # controls expert TP sharding: if false, tp and ep are applied separately to attn/FFN; if true, TP applies to both
+    tp_ep: true
+  inference:
+    replica_count: 1 # inference throughput scaling only
+    moe_dp: 1 # inference expert pool expansion (EP_eff = tp * moe_dp)
 network:
   dimensions:
     - id: dim0
@@ -112,7 +119,7 @@ network:
         energy_per_bit: 8e-12 # (J/bit)
         util: 1.0
       collective_override: {} # overrides execution_backend.collectives when provided
-      parallelisms: [tp, cp, lp, dp]
+      parallelisms: [tp, cp, ep, pp, dp]
 
 
 

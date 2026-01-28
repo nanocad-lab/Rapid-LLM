@@ -20,3 +20,5 @@ tools/comp/wrapper_outputs/*
 memory-summary/
 validation_scripts/validation_configs/hardware-config/a100_80GB_uci_*
 tools/parallelism_best_runtimes_*
+tools/scan_configs.py
+tools/add_interm_dim_from_configs.py

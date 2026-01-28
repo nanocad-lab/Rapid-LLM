@@ -1,0 +1,26 @@
+model_param:
+  mode: LLM
+  run_type: training
+  tied_embeddings: false
+  model_type: llama
+  global_batch_size: 80
+  gradient_accumulation_steps: 1
+  seq_len: 4096
+  decode_len: 1024
+  hidden_dim: 2048
+  attention:
+    attention_type: mha
+    num_heads: 16
+    kv_heads: null
+    use_flashattention: true
+    attention_tile_size: 128
+  intermediate_size: 10944
+  moe:
+    num_experts: 64
+    top_k: 6
+    moe_intermediate_size: 1408
+    n_shared_experts: 2
+    moe_layer_freq: 1
+    first_k_dense_replace: 1
+  vocab_size: 102400
+  num_layers: 28

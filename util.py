@@ -1,3 +1,18 @@
+# Copyright 2026 NanoCad lab, UCLA
+# https://nanocad.ee.ucla.edu/
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import atexit
 import os
 import sys
@@ -90,19 +105,26 @@ def relpath_display(path: str) -> str:
     return rel
 
 
-def _collect_parallelism_values(hw_config):
+def _collect_parallelism_values(hw_config, *, run_type: str) -> dict:
     sch_config = getattr(hw_config, "sch_config", None)
     if sch_config is None:
         return {}
-
-    values = {}
-    if hasattr(sch_config, "__dataclass_fields__"):
-        for name in sch_config.__dataclass_fields__:
-            values[str(name).lower()] = getattr(sch_config, name)
-        return values
-    for name in getattr(sch_config, "_fields", []):
-        values[str(name).lower()] = getattr(sch_config, name)
-    return values
+    normalized = str(run_type or "training").lower()
+    if normalized == "inference":
+        return {
+            "tp": sch_config.tp,
+            "cp": sch_config.cp,
+            "ep": sch_config.inference.moe_dp,
+            "pp": sch_config.pp,
+            "dp": 1,
+        }
+    return {
+        "tp": sch_config.tp,
+        "cp": sch_config.cp,
+        "ep": sch_config.train.ep,
+        "pp": sch_config.pp,
+        "dp": sch_config.train.dp,
+    }
 
 
 def _format_parallelism_terms(dim, parallelism_values):
@@ -121,9 +143,9 @@ def _format_parallelism_terms(dim, parallelism_values):
 
 
 def network_topology_summary_training(hw_config):
-    parallelism_values = _collect_parallelism_values(hw_config)
+    parallelism_values = _collect_parallelism_values(hw_config, run_type="training")
     dimensions = list(getattr(hw_config.network_layout, "dimensions", ()))
-    ordered_axes = ["tp", "cp", "lp", "dp"]
+    ordered_axes = ["tp", "cp", "ep", "pp", "dp"]
     formatted_terms = []
     for axis in ordered_axes:
         value = parallelism_values.get(axis)
@@ -158,8 +180,12 @@ def network_topology_summary_training(hw_config):
 
 
 def network_topology_summary_inference(hw_config):
-    parallelism_values = _collect_parallelism_values(hw_config)
-    ordered_axes = ["tp", "cp", "lp", "dp"]
+    parallelism_values = _collect_parallelism_values(hw_config, run_type="inference")
+    sch_config = getattr(hw_config, "sch_config", None)
+    replica_count = 1
+    if sch_config is not None:
+        replica_count = max(1, int(sch_config.inference.replica_count))
+    ordered_axes = ["tp", "cp", "ep", "pp", "dp"]
     formatted_terms = []
     for axis in ordered_axes:
         value = parallelism_values.get(axis)
@@ -209,30 +235,12 @@ def network_topology_summary_inference(hw_config):
     if not total_numeric:
         total_aggregate = None
 
-    dp_factor = parallelism_values.get("dp", 1)
-    try:
-        dp_replicas = max(1, int(dp_factor))
-    except (TypeError, ValueError):
-        dp_replicas = dp_factor if dp_factor else 1
-    per_replica = None
-    if isinstance(total_aggregate, (int, float)) and isinstance(dp_replicas, (int, float)):
-        if dp_replicas:
-            if isinstance(total_aggregate, int) and isinstance(dp_replicas, int) and total_aggregate % dp_replicas == 0:
-                per_replica = total_aggregate // dp_replicas
-            else:
-                per_replica = total_aggregate / dp_replicas
-        else:
-            per_replica = total_aggregate
-    else:
-        per_replica = total_aggregate
-    if isinstance(per_replica, float) and per_replica.is_integer():
-        per_replica = int(per_replica)
     if isinstance(total_aggregate, float) and total_aggregate.is_integer():
         total_aggregate = int(total_aggregate)
-    lines.append(f"  replicas (dp): {dp_replicas}")
-    lines.append(
-        f"  => aggregate = {per_replica} GPUs per replica ({total_aggregate} total)"
-    )
+    lines.append(f"  replica_count: {replica_count} (throughput-only)")
+    lines.append(f"  => aggregate = {total_aggregate} GPUs per modeled replica")
+    if isinstance(total_aggregate, int):
+        lines.append(f"  => effective total GPUs = {total_aggregate * replica_count}")
     return lines
 
 def print_error(message):

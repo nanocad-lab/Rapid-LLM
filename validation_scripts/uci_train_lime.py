@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# Copyright 2026 NanoCad lab, UCLA
+# https://nanocad.ee.ucla.edu/
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 UCI training validation harness combining DDP and FSDP grid-search measurements.
 
@@ -46,10 +61,10 @@ MERGED_CSV = PROJECT_ROOT / "validation_scripts" / "imec_data" / "uci_train.csv"
 GLOBAL_BATCH_SIZE = 128
 MICRO_BATCH_SIZE = 1
 
-# Network modeling constants (4-GPU ring: 2 NVLink, 2 PCIe)
+# Network modeling constants (PCIe ring for TP/CP, NVLink ring for PP/DP)
+TP_ON_NVLINK = False
 NVLINK_LINK_BW_GB = 12 * 25  # GB/s per GPU worth of NVLink throughput
 PCIE_LINK_BW_GB = 25  # GB/s per GPU PCIe
-AVG_NVLINK_PCIE_BW_GB = (NVLINK_LINK_BW_GB + PCIE_LINK_BW_GB) // 2
 NVLINK_LATENCY_S = 1e-6
 PCIE_LATENCY_S = 5e-6
 ENERGY_PER_BIT = 8e-12
@@ -153,61 +168,22 @@ def _make_dimension(idx: int, label: str, axes: List[str], bandwidth_gb: float, 
 
 
 def _build_network_override(tp: int, pp: int, cp: int, dp: int, astra_mode: str) -> Tuple[Dict[str, object], str]:
-    """Construct a network override that mirrors the 4-GPU ring (2 NVLink, 2 PCIe)."""
-    sizes = {"tp": int(tp), "lp": int(pp), "cp": int(cp), "dp": int(dp)}
-    active_axes = [axis for axis, value in sizes.items() if value > 1]
-    mapping_desc: str
-    dims: List[Dict[str, object]] = []
+    """Construct a fixed 2D ring network: TP/CP on PCIe (or NVLink), PP/DP on NVLink (or PCIe)."""
+    tp_cp_bw = NVLINK_LINK_BW_GB if TP_ON_NVLINK else PCIE_LINK_BW_GB
+    tp_cp_lat = NVLINK_LATENCY_S if TP_ON_NVLINK else PCIE_LATENCY_S
+    pp_dp_bw = PCIE_LINK_BW_GB if TP_ON_NVLINK else NVLINK_LINK_BW_GB
+    pp_dp_lat = PCIE_LATENCY_S if TP_ON_NVLINK else NVLINK_LATENCY_S
+    tp_cp_label = "NVLink" if TP_ON_NVLINK else "PCIe"
+    pp_dp_label = "PCIe" if TP_ON_NVLINK else "NVLink"
 
-    if len(active_axes) <= 1:
-        axis = active_axes[0] if active_axes else None
-        axes_for_dim0: List[str] = []
-        if axis in {"tp", "cp"} and (sizes["tp"] > 1 or sizes["cp"] > 1):
-            # Hierarchical requires both tp/cp in the first active dim when either is used.
-            axes_for_dim0 = ["tp", "cp"]
-        elif axis:
-            axes_for_dim0 = [axis]
-        bw = AVG_NVLINK_PCIE_BW_GB if axis == "lp" else PCIE_LINK_BW_GB
-        dims.append(_make_dimension(0, "ring_single_axis", axes_for_dim0, bw, PCIE_LATENCY_S, "Ring"))
-        dims.append(_make_dimension(1, "unused_dim1", [], PCIE_LINK_BW_GB, PCIE_LATENCY_S, "FullyConnected"))
-        dims.append(_make_dimension(2, "unused_dim2", [], PCIE_LINK_BW_GB, PCIE_LATENCY_S, "FullyConnected"))
-        mapping_desc = f"1D Ring on {axes_for_dim0 or ['none']} @ {bw:g} GB/s"
-    else:
-        fast_axes: List[str] = []
-        if sizes["tp"] > 1 or sizes["cp"] > 1:
-            # First active dim must contain both tp and cp for hierarchical/hybrid.
-            fast_axes = ["tp", "cp"]
-
-        remaining_axes: List[str] = []
-        for axis in ("lp", "dp"):
-            if sizes[axis] > 1:
-                remaining_axes.append(axis)
-
-        if not fast_axes:
-            # No tp/cp present: prefer lp on the fast dimension, keep dp for the outermost.
-            if sizes["lp"] > 1:
-                fast_axes = ["lp"]
-                if "lp" in remaining_axes:
-                    remaining_axes.remove("lp")
-            else:
-                fast_axes = [active_axes[0]]
-                if fast_axes[0] in remaining_axes:
-                    remaining_axes.remove(fast_axes[0])
-
-        # Ensure dp stays on the outermost (last active) dimension when present.
-        if sizes["dp"] > 1:
-            if "dp" in fast_axes and remaining_axes:
-                fast_axes = [ax for ax in fast_axes if ax != "dp"]
-                if "dp" not in remaining_axes:
-                    remaining_axes.append("dp")
-            elif "dp" not in fast_axes and "dp" not in remaining_axes:
-                remaining_axes.append("dp")
-
-        dims.append(_make_dimension(0, "fast_fc", fast_axes, PCIE_LINK_BW_GB, PCIE_LATENCY_S, "FullyConnected"))
-        dims.append(_make_dimension(1, "slow_fc", remaining_axes, NVLINK_LINK_BW_GB, NVLINK_LATENCY_S, "FullyConnected"))
-        dims.append(_make_dimension(2, "unused_dim2", [], PCIE_LINK_BW_GB, PCIE_LATENCY_S, "FullyConnected"))
-        mapping_desc = f"2D FC dim0={fast_axes or ['none']} (PCIe), dim1={remaining_axes or ['none']} (NVLink)"
-
+    dims = [
+        _make_dimension(0, "tp_cp_ring", ["tp", "cp"], tp_cp_bw, tp_cp_lat, "Ring"),
+        _make_dimension(1, "pp_dp_ring", ["pp", "dp"], pp_dp_bw, pp_dp_lat, "Ring"),
+    ]
+    mapping_desc = (
+        f"2D Ring dim0=tp/cp ({tp_cp_label}, tp={tp}, cp={cp}), "
+        f"dim1=pp/dp ({pp_dp_label}, pp={pp}, dp={dp})"
+    )
     network_override: Dict[str, object] = {
         "network": {
             "dimensions": dims,
@@ -264,12 +240,13 @@ def _build_spec(
 
     hw_overrides = {
         "parallelism": {
-            "dp": int(dp),
             "tp": int(tp),
             "tp_sp": False,
             "cp": int(cp),
-            "lp": int(pp),
+            "pp": int(pp),
             "mb": int(eff_mb),  # align microbatch count with pipeline stages
+            "train": {"dp": int(dp), "ep": 1, "tp_ep": True},
+            "inference": {"replica_count": 1, "moe_dp": 1},
         },
         "sw_param": {
             # DDP -> zero_stage 0, FSDP -> zero_stage 3

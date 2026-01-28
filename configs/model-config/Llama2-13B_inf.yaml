@@ -14,8 +14,13 @@ model_param:
     kv_heads: 8  # Number of key/value heads (used only when attention_type = "gqa")
     use_flashattention: true  # Enable FlashAttention optimization
     attention_tile_size: 256  # Tile size used in attention computation
-  num_experts: 1   # Number of experts in MoE layers. Set to 1 to disable MoE.
-  top_k: 1   # Number of active experts per token in MoE
+  moe:
+    num_experts: 1
+    top_k: 1
+    moe_intermediate_size: 13824
+    n_shared_experts: 0
+    moe_layer_freq: 1
+    first_k_dense_replace: 40
   intermediate_size: 13824 # Output dimension of the first FFN layer (typically 4×hidden_dim)
   vocab_size: 32000  # Vocabulary size
   num_layers: 40 # Number of transformer layers

@@ -1,3 +1,18 @@
+# Copyright 2026 NanoCad lab, UCLA
+# https://nanocad.ee.ucla.edu/
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 HuggingFace Benchmark Validation Script
 
@@ -48,7 +63,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _ensure_project_root_on_path()
 CSV_PATH = PROJECT_ROOT / "validation_scripts" / "huggingface_data" / "bench_final2_mod_add.csv"
 BASE_HW_CONFIG_PATH = PROJECT_ROOT / "configs" / "hardware-config" / "H100_SXM5_80GB.yaml"
-CALIBRATED_HW_CONFIG_PATH = PROJECT_ROOT / "configs" / "hardware-config" / "H100_SXM5_80GB_calibrated.yaml"
+CALIBRATED_HW_CONFIG_PATH = PROJECT_ROOT / "configs" / "hardware-config" / "H100_SXM5_80GB_calibrated_tuned.yaml"
 USE_CALIBRATED_HW = True
 HW_CONFIG_PATH = CALIBRATED_HW_CONFIG_PATH if USE_CALIBRATED_HW else BASE_HW_CONFIG_PATH
 OUTPUT_DIR = PROJECT_ROOT / "output" / "validation" / "huggingface"
@@ -57,6 +72,8 @@ OUTPUT_DIR = PROJECT_ROOT / "output" / "validation" / "huggingface"
 MODE = "both"
 # Memory error target: "res" (reserved) or "alloc" (allocated)
 MEMORY_ERROR_TARGET = "res"
+# OOM classification threshold for predicted peak memory (GB).
+OOM_PRED_THRESHOLD_GB = 80.0
 
 # Parallel execution
 NUM_WORKERS = 100
@@ -64,22 +81,14 @@ NUM_WORKERS = 100
 # Filtering options
 ASSUME_BF16 = True          # Treat empty dtype as bfloat16
 FILTER_PP_FIX = False       # Only use rows where after_pp_fix=True
-MAX_ROWS = 1200             # Limit rows for testing (None = all)
+MAX_ROWS = None             # Limit rows for testing (None = all)
 
 # Selective runs: only execute the listed config IDs (ignore cache).
 # IDs can be row_index values (as strings) or config labels
 # (see _format_config_label / BenchmarkRow.label).
 SELECTIVE_RUN = False
 # add these: 1171, 1371, 1377, 32, 39, 47, 50, 198
-SELECTIVE_RUN_IDS: Sequence[str] = (
-    "1171",
-    "1377",
-    "32",
-    "39",
-    "47",
-    "50",
-    "198",
-)
+SELECTIVE_RUN_IDS: Sequence[str] = ()
 SELECTIVE_RUN_OUTPUT_DIR = OUTPUT_DIR / "selective_runs"
 SELECTIVE_DUMP_HW_CONFIGS = False
 
@@ -91,6 +100,7 @@ ATTENTION_TILE_SIZE = 128  # Set to int (e.g., 128) if using flash attention
 ENABLE_PLOTS = True
 ENABLE_GLOBAL_PLOTS = True
 ENABLE_CATEGORY_PLOTS = True
+ERROR_PCT_CAP = 200.0
 EMIT_LOGS = True
 SUPPRESS_WORKER_OUTPUT = True
 SHUFFLE_SEED: Optional[int] = 1337
@@ -103,13 +113,13 @@ DUMP_FIRST_ROW_HW_CONFIG_NAME = "first_row_hw_config.yaml"
 CHUNK_SIZE = 600               # Process rows in chunks (None or <=0 disables)
 ENABLE_RESULT_CACHE = True
 CACHE_PATH = OUTPUT_DIR / "validation_cache.jsonl"
-CACHE_KEY_VERSION = 12
+CACHE_KEY_VERSION = 15
 HARD_CLEANUP_BETWEEN_CHUNKS = True
 # Cache-only rebuild mode (skip RAPID execution)
-REBUILD_FROM_CACHE_ONLY = False
+REBUILD_FROM_CACHE_ONLY = True
 # Fast mode: enforce per-row worker timeouts (best-effort)
 FAST_MODE = True
-FAST_MODE_TIMEOUT_S = 50.0
+FAST_MODE_TIMEOUT_S = 45.0
 
 # AstraSim isolation (avoid cache contention / temp spam in repo root)
 ASTRA_CACHE_MODE: Optional[str] = "NO_CACHE"  # NO_CACHE | CACHE_READONLY | CACHE_READWRITE | None (keep env)
@@ -127,10 +137,10 @@ TOKS_PER_GPU_DENOM = "num_gpus"
 USE_DERIVED_MICROBATCH_COUNT = True
 MB_GRAPH_CAP: Optional[int] = None  # cap microbatch count in graph to keep runs fast (None disables)
 PIPELINE_MEM_SCHEDULE = "1f1b"   # "gpipe" to disable, "1f1b"/"auto" to scale activations
-PIPELINE_ACTIVATION_WINDOW_MULT = 2.0  # effective in-flight window = ceil(lp * multiplier)
+PIPELINE_ACTIVATION_WINDOW_MULT = 2.0  # effective in-flight window = ceil(pp * multiplier)
 
 # Category plotting
-CATEGORY_RUN: Optional[Sequence[str] | str] = "all"  # "auto", "default", "all", or list of category names
+CATEGORY_RUN: Optional[Sequence[str] | str] = ("all")  # "auto", "default", "all", or list of category names
 CATEGORY_MIN_ROWS = 10
 CATEGORY_OUTPUT_DIR = OUTPUT_DIR / "categories"
 CATEGORY_AUTO_TOP_K = 5
@@ -160,8 +170,11 @@ CATEGORY_PRESETS: Dict[str, Sequence[str]] = {
         "model=small",
         "model=large",
         "status=Success",
-        "status=OOM",
+        "status=OOM",   
     ),
+    "pp1":{
+        "pp=1",
+    },
     "parallelism": (
         "pp=1",
         "pp>1",
@@ -191,24 +204,7 @@ CATEGORY_PRESETS: Dict[str, Sequence[str]] = {
     "status": (
         "status=Success",
         "status=OOM",
-    ),
-    # Curated from HF timing error analysis (dp*tp tok/s conversion).
-    "timing_best_worst": (
-        # Best timing buckets (showcase)
-        "tp=1",
-        "tp=2",
-        "pp=1",
-        "after_pp_fix=true",
-        "mbs=1",
-        "dp=4",
-        # Worst timing buckets (fix)
-        "tp=32",
-        "after_pp_fix=false",
-        "mbs>=8",
-        "batch_accum<=8",
-        "dp=2",
-        "zero=0",
-    ),
+    )
 }
 
 
@@ -331,6 +327,10 @@ def _le(attr: str, value: Any) -> Callable[[ComparisonResult], bool]:
     return lambda c: getattr(c.row, attr) <= value
 
 
+def _and(*preds: Callable[[ComparisonResult], bool]) -> Callable[[ComparisonResult], bool]:
+    return lambda c: all(pred(c) for pred in preds)
+
+
 def _category_definitions() -> List[CategoryDef]:
     """Define category filters for plot breakdowns."""
     defs = [
@@ -349,6 +349,7 @@ def _category_definitions() -> List[CategoryDef]:
         CategoryDef("batch_accum>=64", _ge("batch_accum", 64)),
         CategoryDef("mbs=1", _eq("mbs", 1)),
         CategoryDef("mbs>=8", _ge("mbs", 8)),
+        CategoryDef("pp=1,mbs>=8", lambda c: c.row.pp == 1 and c.row.mbs >= 8),
         CategoryDef("after_pp_fix=true", lambda c: bool(c.row.after_pp_fix)),
         CategoryDef("after_pp_fix=false", lambda c: not bool(c.row.after_pp_fix)),
         CategoryDef("attention=gqa", lambda c: _attention_type(c.row) == "gqa"),
@@ -378,6 +379,122 @@ def _category_definitions() -> List[CategoryDef]:
         defs.append(CategoryDef(f"batch_accum={value}", _eq("batch_accum", value)))
     for value in (1, 2, 4, 8, 16, 32, 64):
         defs.append(CategoryDef(f"mbs={value}", _eq("mbs", value)))
+
+    def _pp1_success(*preds: Callable[[ComparisonResult], bool]) -> Callable[[ComparisonResult], bool]:
+        return _and(_eq("pp", 1), lambda c: c.row.status == "Success", *preds)
+
+    defs.append(
+        CategoryDef(
+            "pp=1,tp=2-16,dp=8-64,status=Success",
+            _pp1_success(
+                lambda c: 2 <= c.row.tp <= 16,
+                lambda c: 8 <= c.row.dp <= 64,
+            ),
+        )
+    )
+
+    defs.append(
+        CategoryDef(
+            "pp=1,tp=2-8,dp=8-64,status=Success",
+            _pp1_success(
+                lambda c: 2 <= c.row.tp <= 8,
+                lambda c: 8 <= c.row.dp <= 64,
+            ),
+        )
+    )
+
+    # base_tp_dp = [
+    #     (8, 2),
+    #     (8, 16),
+    #     (8, 32),
+    #     (8, 64),
+    #     (4, 4),
+    #     (4, 32),
+    #     (4, 64),
+    #     (16, 4),
+    #     (16, 32),
+    #     (32, 1),
+    #     (32, 2),
+    #     (32, 4),
+    #     (2, 64),
+    #     (2, 128),
+    # ]
+    # for tp, dp in base_tp_dp:
+    #     defs.append(
+    #         CategoryDef(
+    #             f"pp=1,tp={tp},dp={dp},status=Success",
+    #             _pp1_success(_eq("tp", tp), _eq("dp", dp)),
+    #         )
+    #     )
+
+    # mbs8_tp_dp = [
+    #     (16, 8),
+    #     (16, 16),
+    #     (32, 16),
+    #     (8, 16),
+    #     (8, 2),
+    #     (32, 1),
+    # ]
+    # for tp, dp in mbs8_tp_dp:
+    #     defs.append(
+    #         CategoryDef(
+    #             f"pp=1,tp={tp},dp={dp},mbs>=8,status=Success",
+    #             _pp1_success(_eq("tp", tp), _eq("dp", dp), _ge("mbs", 8)),
+    #         )
+    #     )
+
+    # accum_ge_16_tp_dp = [
+    #     (8, 2),
+    #     (4, 4),
+    #     (16, 8),
+    # ]
+    # for tp, dp in accum_ge_16_tp_dp:
+    #     defs.append(
+    #         CategoryDef(
+    #             f"pp=1,tp={tp},dp={dp},batch_accum>=16,status=Success",
+    #             _pp1_success(_eq("tp", tp), _eq("dp", dp), _ge("batch_accum", 16)),
+    #         )
+    #     )
+
+    # accum_le_8_tp_dp = [
+    #     (32, 16),
+    #     (16, 16),
+    #     (8, 32),
+    #     (16, 8),
+    #     (8, 16),
+    #     (4, 32),
+    #     (16, 32),
+    #     (4, 64),
+    #     (2, 64),
+    #     (8, 64),
+    # ]
+    # for tp, dp in accum_le_8_tp_dp:
+    #     defs.append(
+    #         CategoryDef(
+    #             f"pp=1,tp={tp},dp={dp},batch_accum<=8,status=Success",
+    #             _pp1_success(_eq("tp", tp), _eq("dp", dp), _le("batch_accum", 8)),
+    #         )
+    #     )
+
+    # hidden_sizes = (2048, 3072, 4096)
+    # for tp, dp in base_tp_dp:
+    #     for hs in hidden_sizes:
+    #         defs.append(
+    #             CategoryDef(
+    #                 f"pp=1,tp={tp},dp={dp},h={hs},status=Success",
+    #                 _pp1_success(_eq("tp", tp), _eq("dp", dp), _eq("hidden_size", hs)),
+    #             )
+    #         )
+
+    # layer_counts = (16, 28, 32)
+    # for tp, dp in base_tp_dp:
+    #     for layers in layer_counts:
+    #         defs.append(
+    #             CategoryDef(
+    #                 f"pp=1,tp={tp},dp={dp},L={layers},status=Success",
+    #                 _pp1_success(_eq("tp", tp), _eq("dp", dp), _eq("num_layers", layers)),
+    #             )
+    #         )
 
     return defs
 
@@ -745,6 +862,55 @@ def filter_rows(
     return filtered
 
 
+def _should_restrict_to_categories(run_spec: Optional[Sequence[str] | str]) -> bool:
+    if run_spec is None:
+        return False
+    if isinstance(run_spec, str):
+        spec = run_spec.strip().lower()
+        if spec in ("all", "none", "auto"):
+            return False
+    return True
+
+
+def _restrict_rows_by_categories(
+    rows: List[BenchmarkRow],
+    run_spec: Optional[Sequence[str] | str],
+    emit_logs: bool,
+) -> List[BenchmarkRow]:
+    if not rows or not _should_restrict_to_categories(run_spec):
+        return rows
+    categories = _select_categories(run_spec)
+    if not categories:
+        return rows
+
+    stub_result = RAPIDResult(success=True)
+    selected: List[BenchmarkRow] = []
+    for row in rows:
+        comp = ComparisonResult(row=row, rapid_result=stub_result)
+        if any(category.predicate(comp) for category in categories):
+            selected.append(row)
+
+    if emit_logs:
+        names = [c.name for c in categories]
+        print(f"[category] Pre-filter rows: {len(selected)}/{len(rows)} using {names}")
+    return selected
+
+
+def load_success_rows(
+    csv_path: Path,
+    assume_bf16: bool = ASSUME_BF16,
+    filter_pp_fix: bool = FILTER_PP_FIX,
+    max_rows: Optional[int] = None,
+    mode: str = "perf_only",
+) -> List[BenchmarkRow]:
+    """Load Success-only rows (skip OOM/Other before parsing)."""
+    df = load_csv(csv_path)
+    if "status" in df.columns:
+        df = df[df["status"] == "Success"].copy()
+    rows = [parse_row(row, int(idx)) for idx, row in df.iterrows()]
+    return filter_rows(rows, mode, assume_bf16, filter_pp_fix, max_rows)
+
+
 # ==============================================================================
 # CONFIG BUILDING (IN-MEMORY)
 # ==============================================================================
@@ -786,12 +952,13 @@ def build_hw_config_dict(
     # Override parallelism
     config['parallelism'] = {
         'auto': False,
-        'dp': row.dp,
         'tp': row.tp,
-        'lp': row.pp,
+        'pp': row.pp,
         'cp': 1,
         'mb': rapid_mb,
         'tp_sp': True,
+        'train': {'dp': row.dp, 'ep': 1, 'tp_ep': True},
+        'inference': {'replica_count': 1, 'moe_dp': 1},
     }
 
     if 'sw_param' not in config:
@@ -799,16 +966,16 @@ def build_hw_config_dict(
     config['sw_param']['dp_zero_stage'] = row.zero_stage
 
     # Override network dimensions with bandwidths from CSV.
-    # Always use 3 dims: inner=tp/cp, mid=lp, outer=dp.
+    # Always use 3 dims: inner=tp/cp, mid=pp, outer=dp.
     tp_use_inter = row.tp > GCN
-    lp_use_inter = (row.tp * row.pp) > GCN
+    pp_use_inter = (row.tp * row.pp) > GCN
     dp_use_inter = (row.nodes > 1) and (row.dp > 1)
 
     # tp_bw = _avg_positive(
     #     [row.rs_inter, row.ag_inter] if tp_use_inter else [row.rs_intra, row.ag_intra]
     # )
-    # lp_bw = _avg_positive(
-    #     [row.rs_inter, row.ag_inter] if lp_use_inter else [row.rs_intra, row.ag_intra]
+    # pp_bw = _avg_positive(
+    #     [row.rs_inter, row.ag_inter] if pp_use_inter else [row.rs_intra, row.ag_intra]
     # )
     # dp_bw = _avg_positive(
     #     [row.ar_inter] if dp_use_inter else [row.ar_intra]
@@ -819,8 +986,8 @@ def build_hw_config_dict(
     )
     tp_bw_intra = _min_positive([row.rs_intra, row.ag_intra])
     tp_bw_inter = _min_positive([row.rs_inter, row.ag_inter])
-    lp_bw = _min_positive(
-        [row.rs_inter, row.ag_inter] if lp_use_inter else [row.rs_intra, row.ag_intra]
+    pp_bw = _min_positive(
+        [row.rs_inter, row.ag_inter] if pp_use_inter else [row.rs_intra, row.ag_intra]
     )
     dp_bw = _min_positive(
         [row.ar_inter] if dp_use_inter else [row.ar_intra]
@@ -849,9 +1016,9 @@ def build_hw_config_dict(
                     f"{int(round(tp_inter))} GB",
                 )
     if len(dims) >= 2:
-        dims[1]['parallelisms'] = ['lp']
-        if lp_bw is not None and lp_bw > 0:
-            dims[1].setdefault('topology', {})['bandwidth'] = f"{int(round(lp_bw))} GB"
+        dims[1]['parallelisms'] = ['pp']
+        if pp_bw is not None and pp_bw > 0:
+            dims[1].setdefault('topology', {})['bandwidth'] = f"{int(round(pp_bw))} GB"
     if len(dims) >= 3:
         dims[2]['parallelisms'] = ['dp']
         if dp_bw is not None and dp_bw > 0:
@@ -888,8 +1055,14 @@ def build_model_config_dict(
             'num_layers': row.num_layers,
             'intermediate_size': intermediate_size,
             'vocab_size': row.vocab_size,
-            'num_experts': 1,
-            'top_k': 1,
+            'moe': {
+                'num_experts': 1,
+                'top_k': 1,
+                'moe_intermediate_size': intermediate_size,
+                'n_shared_experts': 0,
+                'moe_layer_freq': 1,
+                'first_k_dense_replace': row.num_layers,
+            },
             'attention': {
                 'attention_type': attention_type,
                 'num_heads': row.num_heads,
@@ -957,12 +1130,12 @@ def _pipeline_activation_window_factor(row: BenchmarkRow, tc: Any) -> float:
         return 1.0
     mb_actual = _infer_actual_microbatch_count(row)
     mb_graph = max(1, int(getattr(tc, "mb", 1)))
-    lp = max(1, int(getattr(tc, "lp", 1)))
-    if mb_actual <= 1 or lp <= 1 or mb_graph <= 0:
+    pp = max(1, int(getattr(tc, "pp", 1)))
+    if mb_actual <= 1 or pp <= 1 or mb_graph <= 0:
         return 1.0
-    # window = max(1, int(math.ceil(lp * PIPELINE_ACTIVATION_WINDOW_MULT)))
+    # window = max(1, int(math.ceil(pp * PIPELINE_ACTIVATION_WINDOW_MULT)))
     # try pp * mult and also (pp*mult*2-2)
-    window = max(1, int(math.ceil(lp * PIPELINE_ACTIVATION_WINDOW_MULT * 2 - 2)))
+    window = max(1, int(math.ceil(pp * PIPELINE_ACTIVATION_WINDOW_MULT * 2 - 2)))
     window = min(window, mb_actual)
     return float(window) / float(mb_graph)
 
@@ -1160,6 +1333,97 @@ def run_rapid_estimation(
     return result
 
 
+def _evaluate_row_worker(
+    row: BenchmarkRow,
+    mode: str,
+    flash_attention: bool,
+    attention_tile_size: Optional[int],
+) -> ComparisonResult:
+    """Compute a ComparisonResult for a single row (worker-safe)."""
+    rapid_result = run_rapid_estimation(
+        row,
+        mode=mode,
+        flash_attention=flash_attention,
+        attention_tile_size=attention_tile_size,
+    )
+    return compute_comparison(row, rapid_result, mode)
+
+
+def evaluate_rows(
+    rows: Sequence[BenchmarkRow],
+    base_hw_config: Dict[str, Any],
+    mode: str = "perf_only",
+    num_workers: int = NUM_WORKERS,
+    flash_attention: bool = USE_FLASH_ATTENTION,
+    attention_tile_size: Optional[int] = ATTENTION_TILE_SIZE,
+    emit_progress: bool = False,
+    fast_mode: bool = False,
+    timeout_s: Optional[float] = None,
+) -> List[ComparisonResult]:
+    """Evaluate a list of rows without caching or file outputs."""
+    if not rows:
+        return []
+
+    worker_count = min(int(num_workers), len(rows), os.cpu_count() or 1)
+    if worker_count <= 1:
+        _ensure_project_root_on_path()
+        global _BASE_HW_CONFIG
+        _BASE_HW_CONFIG = base_hw_config
+        comparisons = [
+            _evaluate_row_worker(row, mode, flash_attention, attention_tile_size)
+            for row in rows
+        ]
+        comparisons.sort(key=lambda c: c.row.row_index)
+        return comparisons
+
+    progress = None
+    if emit_progress:
+        try:
+            from tqdm import tqdm
+            progress = tqdm(total=len(rows), desc="Evaluating")
+        except Exception:
+            progress = None
+
+    comparisons: List[ComparisonResult] = []
+
+    if fast_mode:
+        def _handle_result(result_data: Dict[str, Any], row: BenchmarkRow) -> None:
+            comparisons.append(_result_data_to_comparison(result_data, row, mode))
+
+        _run_rows_parallel_inmemory(
+            list(rows),
+            base_hw_config,
+            mode,
+            flash_attention,
+            attention_tile_size,
+            worker_count,
+            progress,
+            _handle_result,
+            fast_mode=True,
+            timeout_s=timeout_s,
+        )
+    else:
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(
+            processes=worker_count,
+            initializer=_worker_init,
+            initargs=(base_hw_config,),
+        ) as pool:
+            args = [(row, mode, flash_attention, attention_tile_size) for row in rows]
+            if progress is None:
+                comparisons = pool.starmap(_evaluate_row_worker, args)
+            else:
+                for comp in pool.starmap(_evaluate_row_worker, args):
+                    comparisons.append(comp)
+                    progress.update(1)
+
+    if progress is not None:
+        progress.close()
+
+    comparisons.sort(key=lambda c: c.row.row_index)
+    return comparisons
+
+
 def _process_single_row(row: BenchmarkRow) -> ComparisonResult:
     """Process a single benchmark row (called by worker)."""
     rapid_result = run_rapid_estimation(
@@ -1283,6 +1547,56 @@ def _worker_process_row(
             if run_dir and CLEANUP_ASTRA_TMP:
                 shutil.rmtree(run_dir, ignore_errors=True)
 
+    except Exception as e:
+        result_queue.put({
+            'row_index': row_index,
+            'success': False,
+            'error': str(e),
+            'peak_gb': None,
+            'capacity_exceeded': False,
+            'training_time_s': None,
+            'tok_s_gpu': None,
+            'mfu': None,
+        })
+
+
+def _worker_process_row_inmemory(
+    row_dict: Dict[str, Any],
+    base_hw_config: Dict[str, Any],
+    mode: str,
+    flash_attention: bool,
+    attention_tile_size: Optional[int],
+    result_queue: Queue,
+) -> None:
+    """Worker that uses an in-memory hardware config (no file IO)."""
+    row_index = row_dict.get('row_index', -1)
+    try:
+        _ensure_project_root_on_path()
+        if SUPPRESS_WORKER_OUTPUT:
+            sys.stdout = open(os.devnull, 'w')
+            sys.stderr = open(os.devnull, 'w')
+
+        row = BenchmarkRow(**row_dict)
+        global _BASE_HW_CONFIG
+        _BASE_HW_CONFIG = base_hw_config
+
+        rapid_result = run_rapid_estimation(
+            row,
+            mode=mode,
+            flash_attention=flash_attention,
+            attention_tile_size=attention_tile_size,
+        )
+
+        result_queue.put({
+            'row_index': row_index,
+            'success': rapid_result.success,
+            'error': rapid_result.error,
+            'peak_gb': rapid_result.peak_gb,
+            'capacity_exceeded': rapid_result.capacity_exceeded,
+            'training_time_s': rapid_result.training_time_s,
+            'tok_s_gpu': rapid_result.tok_s_gpu,
+            'mfu': rapid_result.mfu,
+        })
     except Exception as e:
         result_queue.put({
             'row_index': row_index,
@@ -1424,6 +1738,120 @@ def compute_aggregate_stats(
     return stats
 
 
+def _cap_error_overflow(errors: Sequence[float], cap: float) -> Tuple[List[float], int]:
+    capped: List[float] = []
+    overflow = 0
+    for err in errors:
+        if err > cap:
+            capped.append(cap)
+            overflow += 1
+        else:
+            capped.append(err)
+    return capped, overflow
+
+
+def _label_overflow_xtick(ax, cap: float, label: str) -> None:
+    ticks = list(ax.get_xticks())
+    if not any(math.isclose(tick, cap, abs_tol=1e-6) for tick in ticks):
+        ticks.append(cap)
+        ticks.sort()
+    labels = []
+    for tick in ticks:
+        if math.isclose(tick, cap, abs_tol=1e-6):
+            labels.append(label)
+        else:
+            labels.append(f"{tick:g}")
+    ax.set_xticks(ticks)
+    ax.set_xticklabels(labels)
+
+
+def _should_log_scale(values: Sequence[float]) -> bool:
+    vals = [v for v in values if v is not None and v > 0]
+    if not vals:
+        return False
+    min_val = min(vals)
+    max_val = max(vals)
+    if min_val <= 0:
+        return False
+    return True
+
+
+def _oom_confusion_counts(
+    comparisons: List[ComparisonResult],
+    threshold_gb: float,
+) -> Dict[str, int]:
+    counts = {"tp": 0, "fp": 0, "fn": 0, "tn": 0, "unknown": 0}
+    for comp in comparisons:
+        peak_gb = comp.rapid_result.peak_gb
+        if peak_gb is None or math.isnan(peak_gb):
+            counts["unknown"] += 1
+            continue
+        pred_oom = float(peak_gb) > float(threshold_gb)
+        actual_oom = comp.row.status == "OOM"
+        if pred_oom and actual_oom:
+            counts["tp"] += 1
+        elif pred_oom and not actual_oom:
+            counts["fp"] += 1
+        elif (not pred_oom) and actual_oom:
+            counts["fn"] += 1
+        else:
+            counts["tn"] += 1
+    return counts
+
+
+def _generate_oom_confusion_plot(
+    comparisons: List[ComparisonResult],
+    output_dir: Path,
+    threshold_gb: float,
+    title_suffix: Optional[str] = None,
+) -> Optional[Path]:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    counts = _oom_confusion_counts(comparisons, threshold_gb)
+    total = counts["tp"] + counts["fp"] + counts["fn"] + counts["tn"]
+    if total == 0:
+        return None
+
+    labels = [
+        "TP (OOM)",
+        "FP (pred OOM)",
+        "FN (missed OOM)",
+        "TN (correct non-OOM)",
+    ]
+    values = [counts["tp"], counts["fp"], counts["fn"], counts["tn"]]
+    colors = ["#2ca02c", "#d62728", "#d62728", "#1f77b4"]
+
+    fig, ax = plt.subplots(1, 1, figsize=(7, 4))
+    bars = ax.bar(labels, values, color=colors)
+    ax.set_ylabel("Count")
+    title = f"OOM classification (pred > {threshold_gb:g} GB, n={total}"
+    if counts["unknown"]:
+        title += f", unknown={counts['unknown']}"
+    title += ")"
+    if title_suffix:
+        title += f" - {title_suffix}"
+    ax.set_title(title)
+    ax.tick_params(axis="x", rotation=20)
+
+    for bar, value in zip(bars, values):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            value + max(1, total * 0.01),
+            str(value),
+            ha="center",
+            va="bottom",
+            fontsize=9,
+        )
+
+    plt.tight_layout()
+    plot_path = output_dir / "oom_classification_counts.png"
+    fig.savefig(plot_path, dpi=200)
+    plt.close(fig)
+    return plot_path
+
+
 def generate_plots(
     comparisons: List[ComparisonResult],
     mode: str,
@@ -1439,14 +1867,48 @@ def generate_plots(
     output_dir.mkdir(parents=True, exist_ok=True)
     plot_paths = []
 
+    def _scatter_pred_vs_actual(
+        actuals: List[float],
+        preds: List[float],
+        errors: List[float],
+        title: str,
+        filename: str,
+        x_label: str,
+        y_label: str,
+    ) -> Optional[Path]:
+        if not actuals or not preds:
+            return None
+        fig, ax = plt.subplots(1, 1, figsize=(6, 5))
+        ax.scatter(actuals, preds, s=14, alpha=0.6, edgecolors="none")
+        min_val = min(min(actuals), min(preds))
+        max_val = max(max(actuals), max(preds))
+        ax.plot([min_val, max_val], [min_val, max_val], color="red", linestyle="--", linewidth=1.0, label="x=y")
+        if _should_log_scale(actuals + preds):
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+        mean_abs = float(np.mean(np.abs(errors))) if errors else float("nan")
+        title_line = f"{title} (n={len(actuals)}, mean_abs={mean_abs:.2f}%)"
+        if title_suffix:
+            title_line += f" - {title_suffix}"
+        ax.set_title(title_line)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(y_label)
+        ax.legend(loc="best")
+        plt.tight_layout()
+        plot_path = output_dir / filename
+        fig.savefig(plot_path, dpi=200)
+        plt.close(fig)
+        return plot_path
+
     if mode in ('mem_only', 'both'):
         mem_errors = [
             _memory_error_value(c) for c in comparisons
             if _memory_error_value(c) is not None and not math.isnan(_memory_error_value(c))
         ]
         if mem_errors:
+            mem_plot_errors, mem_overflow = _cap_error_overflow(mem_errors, ERROR_PCT_CAP)
             fig, ax = plt.subplots(1, 1, figsize=(6, 5))
-            ax.hist(mem_errors, bins=50, edgecolor='black', alpha=0.7)
+            ax.hist(mem_plot_errors, bins=50, edgecolor='black', alpha=0.7)
             ax.set_xlabel('Error (%)')
             ax.set_ylabel('Count')
             title = f"Memory vs Mem {_memory_metric_label()} (n={len(mem_errors)})"
@@ -1454,6 +1916,8 @@ def generate_plots(
                 title += f" - {title_suffix}"
             ax.set_title(title)
             ax.axvline(x=0, color='r', linestyle='--')
+            if mem_overflow:
+                _label_overflow_xtick(ax, ERROR_PCT_CAP, f">{int(ERROR_PCT_CAP)}%")
 
             plt.tight_layout()
             mem_plot = output_dir / 'memory_error_distribution.png'
@@ -1461,12 +1925,49 @@ def generate_plots(
             plt.close(fig)
             plot_paths.append(mem_plot)
 
+            mem_actuals = []
+            mem_preds = []
+            mem_scatter_errors = []
+            for comp in comparisons:
+                pred = comp.rapid_result.peak_gb
+                actual = _memory_actual_value(comp.row)
+                if pred is None or actual is None:
+                    continue
+                if not math.isfinite(float(pred)) or not math.isfinite(float(actual)):
+                    continue
+                if float(actual) <= 0:
+                    continue
+                mem_actuals.append(float(actual))
+                mem_preds.append(float(pred))
+                mem_scatter_errors.append(_pct_error(float(pred), float(actual)))
+            scatter_path = _scatter_pred_vs_actual(
+                mem_actuals,
+                mem_preds,
+                mem_scatter_errors,
+                f"Memory vs Mem {_memory_metric_label()}",
+                "memory_scatter.png",
+                f"Actual Mem {_memory_metric_label()} (GB)",
+                "Predicted Peak (GB)",
+            )
+            if scatter_path is not None:
+                plot_paths.append(scatter_path)
+
+        oom_plot = _generate_oom_confusion_plot(
+            comparisons,
+            output_dir,
+            OOM_PRED_THRESHOLD_GB,
+            title_suffix=title_suffix,
+        )
+        if oom_plot is not None:
+            plot_paths.append(oom_plot)
+
     if mode in ('perf_only', 'both'):
         tok_errors = [c.tok_s_error_pct for c in comparisons
                       if c.tok_s_error_pct is not None and not math.isnan(c.tok_s_error_pct)]
         if tok_errors:
+            tok_plot_errors, tok_overflow = _cap_error_overflow(tok_errors, ERROR_PCT_CAP)
             fig, ax = plt.subplots(1, 1, figsize=(6, 5))
-            ax.hist(tok_errors, bins=50, edgecolor='black', alpha=0.7)
+            ax.hist(tok_plot_errors, bins=50, edgecolor='black', alpha=0.7)
             ax.set_xlabel('Error (%)')
             ax.set_ylabel('Count')
             title = f"tok/s/gpu Error (n={len(tok_errors)})"
@@ -1474,12 +1975,43 @@ def generate_plots(
                 title += f" - {title_suffix}"
             ax.set_title(title)
             ax.axvline(x=0, color='r', linestyle='--')
+            if tok_overflow:
+                _label_overflow_xtick(ax, ERROR_PCT_CAP, f">{int(ERROR_PCT_CAP)}%")
 
             plt.tight_layout()
             perf_plot = output_dir / 'performance_error_distribution.png'
             fig.savefig(perf_plot, dpi=200)
             plt.close(fig)
             plot_paths.append(perf_plot)
+
+            tok_actuals = []
+            tok_preds = []
+            tok_scatter_errors = []
+            for comp in comparisons:
+                if comp.tok_s_error_pct is None:
+                    continue
+                pred = comp.rapid_result.tok_s_gpu
+                actual = comp.row.tok_s_gpu
+                if pred is None or actual is None:
+                    continue
+                if not math.isfinite(float(pred)) or not math.isfinite(float(actual)):
+                    continue
+                if float(actual) <= 0:
+                    continue
+                tok_actuals.append(float(actual))
+                tok_preds.append(float(pred))
+                tok_scatter_errors.append(_pct_error(float(pred), float(actual)))
+            scatter_path = _scatter_pred_vs_actual(
+                tok_actuals,
+                tok_preds,
+                tok_scatter_errors,
+                "tok/s/gpu",
+                "performance_scatter.png",
+                "Actual tok/s/gpu",
+                "Predicted tok/s/gpu",
+            )
+            if scatter_path is not None:
+                plot_paths.append(scatter_path)
 
     return plot_paths
 
@@ -2103,6 +2635,149 @@ def _run_rows_parallel(
             _cleanup_processes(pending, result_queue)
     return interrupted
 
+
+def _run_rows_parallel_inmemory(
+    rows: List[BenchmarkRow],
+    base_hw_config: Dict[str, Any],
+    mode: str,
+    flash_attention: bool,
+    attention_tile_size: Optional[int],
+    num_workers: int,
+    progress: Optional[Any],
+    result_handler,
+    fast_mode: bool,
+    timeout_s: Optional[float],
+) -> bool:
+    """Run rows in parallel with per-row timeout using in-memory config."""
+    if not rows:
+        return False
+
+    import time
+
+    ctx = multiprocessing.get_context('spawn')
+    result_queue: multiprocessing.Queue = ctx.Queue()
+    pending: Dict[int, Tuple[multiprocessing.Process, BenchmarkRow]] = {}
+    completed: set = set()
+    start_times: Dict[int, float] = {}
+
+    row_lookup: Dict[int, BenchmarkRow] = {r.row_index: r for r in rows}
+    row_dicts = [asdict(r) for r in rows]
+    row_dict_iter = iter(row_dicts)
+
+    worker_count = min(num_workers, len(rows), os.cpu_count() or 1)
+    timeout_val = float(timeout_s) if timeout_s is not None else FAST_MODE_TIMEOUT_S
+
+    def _start_next() -> bool:
+        try:
+            row_dict = next(row_dict_iter)
+        except StopIteration:
+            return False
+        row = row_lookup[row_dict['row_index']]
+        proc = ctx.Process(
+            target=_worker_process_row_inmemory,
+            args=(
+                row_dict,
+                base_hw_config,
+                mode,
+                flash_attention,
+                attention_tile_size,
+                result_queue,
+            ),
+        )
+        proc.start()
+        pending[row.row_index] = (proc, row)
+        start_times[row.row_index] = time.monotonic()
+        return True
+
+    def _handle_result(result_data: Dict[str, Any], row: BenchmarkRow) -> None:
+        if row.row_index in completed:
+            return
+        if result_handler is not None:
+            result_handler(result_data, row)
+        completed.add(row.row_index)
+        if progress is not None:
+            progress.update(1)
+
+    interrupted = False
+
+    try:
+        for _ in range(worker_count):
+            if not _start_next():
+                break
+
+        while pending or len(completed) < len(rows):
+            completed_ids = []
+            for row_id, (proc, row) in list(pending.items()):
+                if fast_mode and proc.is_alive():
+                    elapsed = time.monotonic() - start_times.get(row_id, time.monotonic())
+                    if timeout_val > 0 and elapsed > timeout_val:
+                        proc.terminate()
+                        time.sleep(0.05)
+                        if proc.is_alive():
+                            try:
+                                proc.kill()
+                            except AttributeError:
+                                proc.terminate()
+                        proc.join(timeout=0.2)
+                        completed_ids.append(row_id)
+                        fail_result = {
+                            'row_index': row_id,
+                            'success': False,
+                            'error': f"Timed out after {timeout_val:.0f}s",
+                            'peak_gb': None,
+                            'capacity_exceeded': False,
+                            'training_time_s': None,
+                            'tok_s_gpu': None,
+                            'mfu': None,
+                        }
+                        _handle_result(fail_result, row)
+                        continue
+                if not proc.is_alive():
+                    proc.join(timeout=0.1)
+                    completed_ids.append(row_id)
+                    if proc.exitcode != 0:
+                        fail_result = {
+                            'row_index': row_id,
+                            'success': False,
+                            'error': f"Process crashed with exit code {proc.exitcode}",
+                            'peak_gb': None,
+                            'capacity_exceeded': False,
+                            'training_time_s': None,
+                            'tok_s_gpu': None,
+                            'mfu': None,
+                        }
+                        _handle_result(fail_result, row)
+
+            for row_id in completed_ids:
+                pending.pop(row_id, None)
+                start_times.pop(row_id, None)
+
+            while True:
+                try:
+                    result_data = result_queue.get_nowait()
+                except queue.Empty:
+                    break
+                row_id = result_data.get('row_index')
+                row = row_lookup.get(row_id)
+                if row is None:
+                    continue
+                _handle_result(result_data, row)
+
+            while len(pending) < worker_count:
+                if not _start_next():
+                    break
+
+            if pending:
+                time.sleep(0.05)
+
+    except KeyboardInterrupt:
+        interrupted = True
+        _cleanup_processes(pending, result_queue)
+    finally:
+        if not interrupted:
+            _cleanup_processes(pending, result_queue)
+    return interrupted
+
 # ==============================================================================
 # MAIN ORCHESTRATION
 # ==============================================================================
@@ -2178,6 +2853,7 @@ def run(
 
     # Filter rows
     filtered_rows = filter_rows(rows, mode, assume_bf16, filter_pp_fix, max_rows)
+    filtered_rows = _restrict_rows_by_categories(filtered_rows, category_run, emit_logs)
     if emit_logs:
         print(f"After filtering: {len(filtered_rows)} rows")
         success_count = sum(1 for r in filtered_rows if r.status == 'Success')

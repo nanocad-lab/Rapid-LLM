@@ -1,0 +1,140 @@
+sw_param:
+  full_recomputation: false
+  kernel_launch_overhead: 5.0e-05
+  dp_zero_stage: 1
+  precision:
+    tensor_format: bf16
+    kv_cache: as_tensor_format
+    parameters: as_tensor_format
+    gradients: fp32
+    grad_communication: as_tensor_format
+    optimizer_states: fp32
+    stats: fp32
+    master_parameters: 0
+  h2d_bandwidth: -1
+  const_mem_offset: 0 GB
+  dp_microbatch: last_mb
+  grad_acc_overhead: 0.0001
+tech_param:
+  core:
+    operating_frequency: 1.83e9
+    num_bundles: 132
+    nominal_flop_rate_per_mcu: 1024
+    nominal_energy_per_flop: 1.8e-13
+    num_mcu_per_bundle: 4
+    FMA_d1: 16
+    FMA_d2: 8
+    dataflow: best
+    util: 0.980679013722699
+  DRAM:
+    size: 80 GB
+    bandwidth: 3350 GB
+    dynamic_energy_per_bit: 4.5e-12
+    latency: 100e-9
+    util: 0.9267424656597386
+  SRAM-L2:
+    size: 50 MB
+    bandwidth: 8138 GB
+    dynamic_energy_per_bit: 130e-15
+    latency: 0
+    util: 1
+  SRAM-L1:
+    size: 30096 KB
+    bandwidth: 22392 GB
+    dynamic_energy_per_bit: 130e-15
+    latency: 0
+    util: 1
+  SRAM-R:
+    size: 33 MB
+    bandwidth: 122 TB
+    dynamic_energy_per_bit: 110e-15
+    latency: 0
+    util: 1
+memory_hierarchy:
+  l0:
+    type: SRAM-R
+    scope: mcu
+  l1:
+    type: SRAM-L1
+    scope: mcu-bundle
+  l2:
+    type: SRAM-L2
+    scope: global
+  l3:
+    type: DRAM
+    scope: global
+parallelism:
+  auto: false
+  tp: 2
+  tp_sp: true
+  cp: 1
+  pp: 2
+  mb: 4
+  train:
+    dp: 2 # data parallelism
+    ep: 1 # expert parallelism
+    # controls expert TP sharding: if false, tp and ep are applied separately to attn/FFN; if true, TP applies to both
+    tp_ep: true
+  inference:
+    replica_count: 2 # inference throughput scaling only
+    moe_dp: 1 # inference expert pool expansion (EP_eff = tp * moe_dp)
+network:
+  dimensions:
+  - id: dim0
+    label: torus2d_tp
+    size: auto
+    topology:
+      type: Ring
+      bandwidth: 100 GB
+      latency: 3.3e-07
+      energy_per_bit: 8e-12
+      util: 1.1996302489891377
+      optimize_2dmap: false
+    collective_override: {}
+    parallelisms:
+    - tp
+    - cp
+  - id: dim1
+    label: inter_torus_infiniband
+    size: auto
+    topology:
+      type: Ring
+      bandwidth: 25 GB
+      latency: 3.3e-07
+      energy_per_bit: 8e-12
+      util: 0.6402758108476558
+    collective_override: {}
+    parallelisms:
+    - pp
+    - dp
+  - id: dim2
+    label: inter_torus_infiniband_dp
+    size: auto
+    topology:
+      type: Ring
+      bandwidth: 25 GB
+      latency: 3.3e-07
+      energy_per_bit: 8e-12
+      util: 0.5023404442992685
+    parallelisms: []
+    collective_override: {}
+  overlap:
+    tp_sp_overlap: 0.1069842368307624
+    tp_overlap: 0.0
+    cp_overlap: 0.0
+execution_backend:
+  model: astra
+  astra:
+    backend: astra
+    mode: full_astrasim_hierarchical
+    collectives:
+      all_gather: auto
+      all_reduce: auto
+      reduce_scatter: auto
+      all_to_all: auto
+    sys_options:
+      endpoint_delay: 5
+      active_chunks_per_dimension: 32
+      preferred_dataset_splits: 4
+inference:
+  kvcache_type: hbm_only

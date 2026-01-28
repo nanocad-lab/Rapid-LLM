@@ -161,7 +161,7 @@ scheduling_param:
   auto: false # Not supported for LLM mode.
   ### LLM PARAMS ###
   dp: 2 # acts as replica count during inference
-  lp: 2 # pipeline stages 
+  pp: 2 # pipeline stages 
   mb: 1 # number of micro-batches
   tp: 2 # tensor parallelism
   tp_sp: true # tensor-sequence parallelism

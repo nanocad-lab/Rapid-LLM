@@ -1,3 +1,18 @@
+# Copyright 2026 NanoCad lab, UCLA
+# https://nanocad.ee.ucla.edu/
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import math
 import os
 import json
@@ -152,36 +167,33 @@ COMMUNICATION_RULES: Dict[
         COMM_RULE_DEFAULT_KEY: {'forward': None, 'backward': None},
     },
 }
-# MoE-specific overrides for router, MLP, and layer norm collectives.
+# MoE-specific overrides for dispatcher collectives (router stays compute-only).
 _MOE_ROUTER_RULE = {
+    'forward': None,
+    'backward': None,
+}
+_MOE_DISPATCH_RULE = {
     'forward': {
         'kind': ALL_TO_ALL,
-        'participants': 'moe',
-        'interconnect': 'tp',
+        'participants': 'ep',
+        'interconnect': 'ep',
     },
     'backward': {
-        'kind': REDUCE_SCATTER,
-        'participants': 'moe',
-        'interconnect': 'tp',
+        'kind': ALL_TO_ALL,
+        'participants': 'ep',
+        'interconnect': 'ep',
     },
 }
-_MOE_MLP_RULE = {
+_MOE_COMBINE_RULE = {
     'forward': {
         'kind': ALL_TO_ALL,
-        'participants': 'moe',
-        'interconnect': 'tp',
+        'participants': 'ep',
+        'interconnect': 'ep',
     },
     'backward': {
         'kind': ALL_TO_ALL,
-        'participants': 'moe',
-        'interconnect': 'tp',
-    },
-}
-_MOE_LAYER_NORM1_RULE = {
-    'backward': {
-        'kind': ALL_TO_ALL,
-        'participants': 'moe',
-        'interconnect': 'tp',
+        'participants': 'ep',
+        'interconnect': 'ep',
     },
 }
 MOE_COMMUNICATION_RULES: Dict[
@@ -189,8 +201,8 @@ MOE_COMMUNICATION_RULES: Dict[
 ] = {
     mode: {
         'router': _MOE_ROUTER_RULE,
-        'MLP': _MOE_MLP_RULE,
-        'layernorm1': _MOE_LAYER_NORM1_RULE,
+        'moe_dispatch': _MOE_DISPATCH_RULE,
+        'moe_combine': _MOE_COMBINE_RULE,
     }
     for mode in ParallelismMode
 }
@@ -260,13 +272,26 @@ class TimeCalculationLLM(TimeCalculation):
         self.transformer_graph: Optional[Graph] = None
         self.transformer_forward_root: Optional[Any] = None
         self.transformer_backward_root: Optional[Any] = None
+        self.transformer_graph_moe: Optional[Graph] = None
+        self.transformer_forward_root_moe: Optional[Any] = None
+        self.transformer_backward_root_moe: Optional[Any] = None
+        self.transformer_graph_no_dp: Optional[Graph] = None
+        self.transformer_forward_root_no_dp: Optional[Any] = None
+        self.transformer_backward_root_no_dp: Optional[Any] = None
+        self.transformer_graph_moe_no_dp: Optional[Graph] = None
+        self.transformer_forward_root_moe_no_dp: Optional[Any] = None
+        self.transformer_backward_root_moe_no_dp: Optional[Any] = None
         self.transformer_analytical_time_forward: Optional[float] = None
         self.transformer_analytical_time_backward: Optional[float] = None
         self.transformer_analytical_time_backward_combined: Optional[float] = None
         self.transformer_astrasim_time_forward: Optional[float] = None
         self.transformer_astrasim_time_backward: Optional[float] = None
+        self.transformer_astrasim_time_forward_moe: Optional[float] = None
+        self.transformer_astrasim_time_backward_moe: Optional[float] = None
         self.transformer_astrasim_per_rank_forward: Optional[List[float]] = None
         self.transformer_astrasim_per_rank_backward: Optional[List[float]] = None
+        self.transformer_astrasim_per_rank_forward_moe: Optional[List[float]] = None
+        self.transformer_astrasim_per_rank_backward_moe: Optional[List[float]] = None
         self.pipeline_astrasim_time: Optional[float] = None
         self.pipeline_astrasim_per_rank: Optional[List[float]] = None
         self.pipeline_graph_no_dp: Optional[Graph] = None
@@ -297,6 +322,14 @@ class TimeCalculationLLM(TimeCalculation):
         else:
             return ParallelismMode.SINGLE
 
+    def is_moe_layer(self, layer_idx: int) -> bool:
+        mask = getattr(self, "moe_layer_mask", None)
+        if not mask:
+            return False
+        if layer_idx < 0 or layer_idx >= len(mask):
+            return False
+        return bool(mask[layer_idx])
+
     @property
     def experts_per_gpu(self) -> int:
         """
@@ -304,7 +337,23 @@ class TimeCalculationLLM(TimeCalculation):
         """
         if not self.use_moe or self.moe_num_experts <= 1:
             return 0
-        moe_ranks = max(1, self.tp * self.cp)
+        moe_ranks = self._moe_routing_group()
+        if self.moe_num_experts % moe_ranks != 0:
+            if self._moe_allow_padding() and _env_flag("RAPID_ALLOW_MOE_EXPERT_PADDING"):
+                if not getattr(self, "_moe_expert_padding_warned", False):
+                    warnings.warn(
+                        "MoE expert count is not divisible by the routing group; "
+                        "padding experts for inference. Set RAPID_ALLOW_MOE_EXPERT_PADDING=0 "
+                        "to enforce divisibility.",
+                        stacklevel=2,
+                    )
+                    self._moe_expert_padding_warned = True
+                return max(1, math.ceil(self.moe_num_experts / moe_ranks))
+            raise ValueError(
+                "moe_num_experts must be divisible by the MoE routing group size. "
+                f"moe_num_experts={self.moe_num_experts}, moe_group={moe_ranks}, "
+                f"tp={self.tp}, ep={self.ep}."
+            )
         return max(1, math.ceil(self.moe_num_experts / moe_ranks))
 
     @experts_per_gpu.setter
@@ -313,6 +362,78 @@ class TimeCalculationLLM(TimeCalculation):
         self._experts_per_gpu_base_value = value
 
 
+    def _moe_tokens_owner(self, batch_size: int, seq_len: int) -> int:
+        seq_divisor = max(1, int(self.cp)) if self.cp > 1 else 1
+        return int(batch_size) * int(math.ceil(float(seq_len) / float(seq_divisor)))
+
+    def _moe_tokens_dispatched(self, tokens_owner: int) -> int:
+        return int(tokens_owner) * int(self.moe_top_k)
+
+    def _moe_tokens_shared(self, tokens_owner: int) -> int:
+        # TODO: Shared experts are replicated across EP for now.
+        return int(tokens_owner) * int(self.n_shared_experts)
+
+    def _moe_routing_group(self) -> int:
+        run_type = str(getattr(getattr(self, "model", None), "run_type", "training")).lower()
+        if run_type == "inference":
+            return max(1, int(self.tp) * int(self.ep))
+        return max(1, int(self.ep))
+
+    def _moe_allow_padding(self) -> bool:
+        run_type = str(getattr(getattr(self, "model", None), "run_type", "training")).lower()
+        return run_type == "inference"
+
+    def _moe_tokens_local(self, tokens_dispatched: int) -> int:
+        moe_group = self._moe_routing_group()
+        return int(math.ceil(float(tokens_dispatched) / float(max(1, moe_group))))
+
+    def _moe_routed_tokens_per_expert(
+        self,
+        batch_size: int,
+        seq_len: int,
+        *,
+        allow_padding: bool = False,
+    ) -> Tuple[int, int, int, int, int]:
+        tokens_owner = self._moe_tokens_owner(batch_size, seq_len)
+        tokens_dispatched = self._moe_tokens_dispatched(tokens_owner)
+        moe_group = self._moe_routing_group()
+        if moe_group <= 0:
+            moe_group = 1
+        if allow_padding:
+            tokens_dispatched = int(math.ceil(float(tokens_dispatched) / float(moe_group)) * moe_group)
+        else:
+            if tokens_dispatched % moe_group != 0:
+                raise ValueError(
+                    "MoE routed tokens must divide evenly across the MoE routing group for batched expert GEMMs. "
+                    f"tokens_dispatched={tokens_dispatched}, moe_group={moe_group}, "
+                    f"tp={self.tp}, ep={self.ep}, tokens_owner={tokens_owner}, "
+                    f"batch_size={batch_size}, seq_len={seq_len}, top_k={self.moe_top_k}, cp={self.cp}."
+                )
+        tokens_local = tokens_dispatched // moe_group
+        experts_per_rank = self.experts_per_gpu
+        if experts_per_rank <= 0:
+            raise ValueError(
+                "MoE experts_per_rank must be positive when use_moe is enabled. "
+                f"experts_per_rank={experts_per_rank}, moe_num_experts={self.moe_num_experts}, "
+                f"tp={self.tp}, ep={self.ep}."
+            )
+        if allow_padding:
+            if tokens_local % experts_per_rank != 0:
+                tokens_local = int(
+                    math.ceil(float(tokens_local) / float(experts_per_rank)) * experts_per_rank
+                )
+                tokens_dispatched = tokens_local * moe_group
+        else:
+            if tokens_local % experts_per_rank != 0:
+                raise ValueError(
+                    "MoE routed tokens per rank must divide evenly across experts for batched expert GEMMs. "
+                    f"tokens_local={tokens_local}, experts_per_rank={experts_per_rank} "
+                    f"(moe_num_experts={self.moe_num_experts}, moe_group={moe_group}). "
+                    f"tokens_owner={tokens_owner}, tokens_dispatched={tokens_dispatched}, "
+                    f"batch_size={batch_size}, seq_len={seq_len}, top_k={self.moe_top_k}, cp={self.cp}."
+                )
+        tokens_per_expert = tokens_local // experts_per_rank
+        return tokens_owner, tokens_dispatched, tokens_local, experts_per_rank, tokens_per_expert
 
     def _param_stats_per_rank(
         self,
@@ -323,28 +444,38 @@ class TimeCalculationLLM(TimeCalculation):
         """Return detailed per-rank parameter counts used for ZeRO modeling."""
 
         tp = max(1, self.tp)
-        lp = max(1, self.lp)
+        pp = max(1, self.pp)
 
-        ffn_proj_factor = 3 if str(self.model_type).lower() == "llama" else 2
-        transformer_param_layer = 4 * hidden_dim * hidden_dim + intermediate_size * ffn_proj_factor * hidden_dim
+        ffn_proj_factor = 3 if llm_util.is_llama_style(self.model_type) else 2
+        if llm_util.is_glm_style(self.model_type):
+            _head_dim, q_size, kv_size = llm_util.attention_dim_sizes(
+                hidden_dim,
+                self.num_heads,
+                self.kv_heads,
+                head_dim=getattr(self, "head_dim", None),
+            )
+            attention_params = (hidden_dim * (q_size + 2 * kv_size)) + (q_size * hidden_dim)
+        else:
+            attention_params = 4 * hidden_dim * hidden_dim
+        transformer_param_layer = attention_params + intermediate_size * ffn_proj_factor * hidden_dim
         params_per_layer_per_rank = transformer_param_layer / tp
 
         total_transformer_params = params_per_layer_per_rank * self.num_layers
-        if lp == 1:
+        if pp == 1:
             transformer_params_local = total_transformer_params
         else:
-            layers_per_stage = math.ceil(self.num_layers / lp)
+            layers_per_stage = math.ceil(self.num_layers / pp)
             transformer_params_local = params_per_layer_per_rank * layers_per_stage
             transformer_params_local = min(transformer_params_local, total_transformer_params)
 
         embedding_params = vocab_size * hidden_dim / tp
         output_params = 0.0 if self.tied_embeddings else embedding_params
 
-        if lp == 1:
+        if pp == 1:
             total_params_per_rank = transformer_params_local + embedding_params + output_params
         else:
             # Pipeline splits embeddings/output across stages. Approximate their contribution by spreading across stages.
-            total_params_per_rank = transformer_params_local + (embedding_params / lp) + (output_params / lp)
+            total_params_per_rank = transformer_params_local + (embedding_params / pp) + (output_params / pp)
 
         max_layer_params = max(params_per_layer_per_rank, embedding_params, output_params)
         return (
@@ -357,7 +488,10 @@ class TimeCalculationLLM(TimeCalculation):
 
     def get_kv_size_bytes(self) -> int:
         """Return the total size in bytes of the KV cache."""
-        total_elements = 2 * self.seq_len * self.micro_batch * self.hidden_dim / self.num_heads * self.kv_heads
+        head_dim = getattr(self, "head_dim", None)
+        if head_dim is None:
+            head_dim = self.hidden_dim // self.num_heads
+        total_elements = 2 * self.seq_len * self.micro_batch * head_dim * self.kv_heads
         return total_elements * self.precision.kv_cache
 
     @staticmethod
@@ -474,7 +608,7 @@ class TimeCalculationLLM(TimeCalculation):
         batch, m, k, n = cls._expand_gemm_descriptor(gemm) 
         return batch, batch * m, k, n
     def _ffn1_output_dim(self, intermediate_size: int) -> int:
-        return 2 * intermediate_size if self.model_type == "llama" else intermediate_size
+        return 2 * intermediate_size if llm_util.is_llama_style(self.model_type) else intermediate_size
     # def sequence
     def get_tensor_reduction_time(
         self,
@@ -508,7 +642,11 @@ class TimeCalculationLLM(TimeCalculation):
         """Return time for flash attention kernel."""
         
         shard_seq = math.ceil(seq_len / max(1, self.cp)) 
-        d = hidden_dim // num_heads # gemm shape for one head is (seq_len, d) x (d, seq_len)
+        head_dim = getattr(self, "head_dim", None)
+        if head_dim is None:
+            head_dim = hidden_dim // num_heads
+        d = head_dim # gemm shape for one head is (seq_len, d) x (d, seq_len)
+        q_size = num_heads * head_dim
         Bc = self.attention_tile_size # kv tile size
         Br = min(Bc, d) # q tile size
         Tr = math.ceil(shard_seq / Br) #number of q tiles
@@ -547,7 +685,7 @@ class TimeCalculationLLM(TimeCalculation):
         attention_forward_time = attention_forward_gemm_time + attention_forward_reduction_time
 
         # HBM traffic consists of only reading Q, K, V once and writing output once
-        attention_mem = 2 * seq_len * (hidden_dim + d * kv_heads) * self.precision.activations
+        attention_mem = 2 * seq_len * (q_size + d * kv_heads) * self.precision.activations
         
         return attention_forward_time, attention_forward_gemm_time, attention_forward_reduction_time, attention_size_f, attention_mem
     
@@ -556,7 +694,10 @@ class TimeCalculationLLM(TimeCalculation):
         """Return time for flash attention backward kernel."""
         
         shard_seq = math.ceil(seq_len / max(1, self.cp)) 
-        d = hidden_dim // num_heads # gemm shape for one head is (seq_len, d) x (d, seq_len)
+        head_dim = getattr(self, "head_dim", None)
+        if head_dim is None:
+            head_dim = hidden_dim // num_heads
+        d = head_dim # gemm shape for one head is (seq_len, d) x (d, seq_len)
         Bc = self.attention_tile_size # kv tile size
         Br = min(Bc, d) # q tile size
         Tr = math.ceil(shard_seq / Br) #number of q tiles
@@ -736,7 +877,12 @@ class TimeCalculationLLM(TimeCalculation):
         gemm_time += self._grad_accum_time(grad_accum_elems, f"{name}_grad_accum")
         return gemm_time, 0, 0
         
-    def _tensor_context_hybrid_gemm_forward(self, gemm: Tuple[int, ...], name: str, gemm_type: Optional[GemmType] = None) -> Tuple[float, float]:
+    def _tensor_context_hybrid_gemm_forward(
+        self,
+        gemm: Tuple[int, ...],
+        name: str,
+        gemm_type: Optional[GemmType] = None,
+    ) -> Tuple[float, float, float, float, Any]:
         """
         Megatron-LM style TPxCP hybrid forward GEMM behavior.
 
@@ -766,6 +912,8 @@ class TimeCalculationLLM(TimeCalculation):
         participants = 0
         total_bytes = 0
         reduction_time = 0
+        total_flops = 2 * batch * m * k * n
+        mem_accesses: Any = []
 
         gemm_type = self._normalize_gemm_type(gemm_type)
         if gemm_type is None:
@@ -775,61 +923,63 @@ class TimeCalculationLLM(TimeCalculation):
         axis_hint = None
 
         if gemm_type == GemmType.ATTENTION_SCORE:  # attention gemm
-            gemm_time = self.get_gemm_time(
+            gemm_time, _, _, mem_accesses = self.get_gemm_time(
                 shard_spec.shard_m,
                 shard_spec.k,
                 shard_spec.n,
                 name,
                 disable_overhead=True,
-            )[0] * batch * shard_spec.batch_scale + self.O
+            )
+            gemm_time = gemm_time * batch * shard_spec.batch_scale + self.O
         elif gemm_type == GemmType.ATTENTION_OUTPUT:  # attention gemm
-            gemm_time = self.get_gemm_time(
+            gemm_time, _, _, mem_accesses = self.get_gemm_time(
                 shard_spec.shard_m,
                 shard_spec.k,
                 shard_spec.n,
                 name,
                 disable_overhead=True,
-            )[0] * batch * shard_spec.batch_scale + self.O
+            )
+            gemm_time = gemm_time * batch * shard_spec.batch_scale + self.O
         elif gemm_type == GemmType.QKV:  # column wise
-            gemm_time = self.get_gemm_time(
+            gemm_time, _, _, mem_accesses = self.get_gemm_time(
                 shard_spec.shard_m,
                 shard_spec.k,
                 shard_spec.shard_n,
                 name,
-            )[0]
+            )
             total_bytes = self.get_kv_size_bytes()  / self.tp # each tp group holds a tp shard of kv for each cp group
             kind = ALL_GATHER
             participants = self.cp # all gather K V for each cp group
             axis_hint = "cp"
         elif gemm_type == GemmType.OUT_PROJ:
-            gemm_time = self.get_gemm_time(
+            gemm_time, _, _, mem_accesses = self.get_gemm_time(
                 shard_spec.shard_m,
                 shard_spec.shard_k,
                 shard_spec.n,
                 name,
-            )[0]
+            )
             total_bytes = math.ceil(self.precision.activations * shard_spec.shard_m * n)
             kind = REDUCE_SCATTER
             participants = self.tp # reduce scatter output activation for each tp group
             axis_hint = "tp"
         elif gemm_type == GemmType.FFN2:  # row wise
-            gemm_time = self.get_gemm_time(
+            gemm_time, _, _, mem_accesses = self.get_gemm_time(
                 shard_spec.shard_m,
                 shard_spec.shard_k,
                 shard_spec.n,
                 name,
-            )[0]
+            )
             total_bytes = math.ceil(self.precision.activations * shard_spec.shard_m * n)
             kind = REDUCE_SCATTER
             participants = self.tp  # reduce scatter output activation for each tp group
             axis_hint = "tp"
         elif gemm_type == GemmType.FFN1:  # column wise
-            gemm_time = self.get_gemm_time(
+            gemm_time, _, _, mem_accesses = self.get_gemm_time(
                 shard_spec.shard_m,
                 shard_spec.k,
                 shard_spec.shard_n,
                 name,
-            )[0]
+            )
         else:
             raise ValueError(f"Unsupported gemm type: {gemm_type}")
         
@@ -844,7 +994,7 @@ class TimeCalculationLLM(TimeCalculation):
             debug_label=name or "comm",
             axis=axis_hint,
         )
-        return gemm_time, reduction_time, total_bytes
+        return gemm_time, reduction_time, total_bytes, total_flops, mem_accesses
     def _tensor_context_hybrid_gemm_backward(self, gemm: Tuple[int, ...], name: str, gemm_type: Optional[GemmType] = None) -> Tuple[float, float]:
         """
         Megatron-LM style TPxCP hybrid backward GEMM behavior.
@@ -1217,7 +1367,12 @@ class TimeCalculationLLM(TimeCalculation):
 
 
         return gemm_time, reduction_time, total_bytes
-    def _context_parallelism_gemm_forward(self, gemm: Tuple[int, ...], name: str, gemm_type: Optional[GemmType] = None) -> Tuple[float, float]:
+    def _context_parallelism_gemm_forward(
+        self,
+        gemm: Tuple[int, ...],
+        name: str,
+        gemm_type: Optional[GemmType] = None,
+    ) -> Tuple[float, float, float, float, Any]:
         """
         Megatron-LM style context-parallel (CP) forward GEMM behavior.
 
@@ -1233,33 +1388,36 @@ class TimeCalculationLLM(TimeCalculation):
         batch, m, k, n = self._expand_gemm_descriptor(gemm)
         total_bytes = 0
         reduction_time = 0
+        total_flops = 2 * batch * m * k * n
+        mem_accesses: Any = []
         gemm_type = self._normalize_gemm_type(gemm_type)
         if gemm_type is None:
             raise ValueError("gemm_type is required for context-parallel forward GEMM")
         shard_spec = self._shard_gemm_descriptor(gemm, gemm_type)
         if gemm_type in (GemmType.ATTENTION_SCORE, GemmType.ATTENTION_OUTPUT):  # attention gemm
-            gemm_time = self.get_gemm_time(
+            gemm_time, _, _, mem_accesses = self.get_gemm_time(
                 shard_spec.shard_m,
                 shard_spec.k,
                 shard_spec.n,
                 name,
                 disable_overhead=True,
-            )[0] * batch + self.O
+            )
+            gemm_time = gemm_time * batch + self.O
         elif gemm_type == GemmType.QKV:  # qkv gemm
-            gemm_time = self.get_gemm_time(
+            gemm_time, _, _, mem_accesses = self.get_gemm_time(
                 shard_spec.shard_m,
                 shard_spec.k,
                 shard_spec.n,
                 name,
-            )[0]
+            )
             total_bytes = self.get_kv_size_bytes()
         elif gemm_type in (GemmType.OUT_PROJ, GemmType.FFN1, GemmType.FFN2):
-            gemm_time = self.get_gemm_time(
+            gemm_time, _, _, mem_accesses = self.get_gemm_time(
                 shard_spec.shard_m,
                 shard_spec.k,
                 shard_spec.n,
                 name,
-            )[0]
+            )
         else:
             raise ValueError(f"Unsupported gemm type: {gemm_type}")
         if gemm_type == GemmType.QKV:
@@ -1275,7 +1433,7 @@ class TimeCalculationLLM(TimeCalculation):
                 axis="cp",
             )
 
-        return gemm_time, reduction_time, total_bytes
+        return gemm_time, reduction_time, total_bytes, total_flops, mem_accesses
 
     def _context_parallelism_gemm_backward(self, gemm: Tuple[int, ...], name: str, gemm_type: Optional[GemmType] = None, comm_after: bool = False) -> Tuple[float, float]:
 
@@ -1380,54 +1538,233 @@ class TimeCalculationLLM(TimeCalculation):
                 axis="cp",
             )
         return gemm_time, reduction_time, total_bytes
-    def get_moe_ffn_f(self, gemm, name, gemm_type: Optional[GemmType] = None):
+
+    def _scale_mem_accesses(self, mem_accesses: Any, scale: int) -> Dict[str, float]:
+        if scale <= 0:
+            return {}
+        levels = self._mem_levels(mem_accesses)
+        if scale == 1:
+            return levels
+        return {k: v * scale for k, v in levels.items()}
+
+    def _fused_batched_comm_time(
+        self,
+        total_bytes: int,
+        gemm_type: Optional[GemmType],
+        *,
+        direction: str,
+    ) -> float:
+        total_bytes = int(math.ceil(float(total_bytes or 0.0)))
+        if total_bytes <= 0:
+            return 0.0
+        gemm_type = self._normalize_gemm_type(gemm_type)
+        if gemm_type is None:
+            return 0.0
+        mode = self.get_parallelism_mode()
+        kind = None
+        participants = None
+        if mode in (ParallelismMode.TENSOR, ParallelismMode.TENSOR_SEQUENCE):
+            if direction == "forward" and gemm_type == GemmType.FFN2:
+                kind = ALL_REDUCE if mode == ParallelismMode.TENSOR else REDUCE_SCATTER
+                participants = self.tp
+            elif direction == "backward" and gemm_type == GemmType.FFN1:
+                kind = ALL_REDUCE if mode == ParallelismMode.TENSOR else REDUCE_SCATTER
+                participants = self.tp
+        elif mode == ParallelismMode.TENSOR_CONTEXT_HYBRID:
+            if direction == "forward" and gemm_type == GemmType.FFN2:
+                kind = REDUCE_SCATTER
+                participants = self.tp
+            elif direction == "backward" and gemm_type == GemmType.FFN1:
+                kind = REDUCE_SCATTER
+                participants = self.tp
+        if not kind or not participants or participants <= 1:
+            return 0.0
+        return self.network_model.collective(
+            kind=kind,
+            size_bytes=total_bytes,
+            participants=participants,
+            ib=self.links["tp"].bandwidth,
+            ll=self.links["tp"].latency,
+            local_bytes=0,
+            debug_label=f"batched_{gemm_type.value}_{direction}",
+            axis="tp",
+        )
+
+    def _batched_gemm_forward_compute(
+        self,
+        gemm: Tuple[int, ...],
+        name: str,
+        gemm_type: Optional[GemmType] = None,
+        *,
+        use_tp: bool = True,
+    ) -> Tuple[float, float, int, float, Dict[str, float]]:
         batch, m, k, n = self._expand_gemm_descriptor(gemm)
-        reduction_time = 0
-        total_bytes = 0
-        total_flops = 2 * batch * m * k * n * self.experts_per_gpu
-        gemm_time, _, _ ,mem_accesses= self.get_gemm_time(m, k, n, name)
-        gemm_time *= self.experts_per_gpu
-
-        if gemm_type == GemmType.FFN2:
-            per_rank_bytes = math.ceil(self.precision.activations * m * n * self.experts_per_gpu)
-            total_bytes = int(math.ceil(per_rank_bytes * self.cp * self.tp )) 
-            reduction_time = self.network_model.collective(
-                kind=ALL_TO_ALL,
-                size_bytes=total_bytes,
-                participants=self.cp * self.tp,
-                ib=self.links["tp"].bandwidth,
-                ll=self.links["tp"].latency,
-                local_bytes=0,
-                debug_label="moe_ffn_f_all_to_all",
+        if batch <= 0 or m <= 0 or k <= 0 or n <= 0:
+            return 0.0, 0.0, 0, 0.0, {}
+        if use_tp:
+            result = self.parallelism_gemm_forward(
+                (m, k, n),
+                name,
+                gemm_type=gemm_type,
             )
-        return gemm_time, reduction_time, total_bytes, total_flops, mem_accesses
+            if len(result) != 5:
+                raise ValueError(f"Unsupported parallelism_gemm_forward return length: {len(result)}")
+            per_time, per_comm_time, per_comm_bytes, per_flops, per_mem = result
+        else:
+            per_time, per_comm_time, per_comm_bytes, per_flops, per_mem = self.single_gpu_gemm_forward(
+                (m, k, n),
+                name,
+                gemm_type=gemm_type,
+            )
+        scale = int(batch)
+        comm_bytes = int(math.ceil(float(per_comm_bytes or 0.0))) * scale
+        comm_time = per_comm_time * scale
+        if use_tp and comm_bytes and scale > 1:
+            fused_time = self._fused_batched_comm_time(comm_bytes, gemm_type, direction="forward")
+            if fused_time:
+                comm_time = fused_time
+        return (
+            per_time * scale,
+            comm_time,
+            comm_bytes,
+            per_flops * scale,
+            self._scale_mem_accesses(per_mem, scale),
+        )
 
-    def get_moe_ffn_b(self, gemm, name, gemm_type):
-        
+    def _batched_gemm_backward_compute(
+        self,
+        gemm: Tuple[int, ...],
+        name: str,
+        gemm_type: Optional[GemmType] = None,
+        *,
+        use_tp: bool = True,
+    ) -> Tuple[float, float, int]:
         batch, m, k, n = self._expand_gemm_descriptor(gemm)
-        reduction_time = 0
-        total_bytes = 0
-        grad_time_act = self.get_gemm_time(m, n, k, name)[0] * self.experts_per_gpu
-        grad_time_wt = self.get_gemm_time(k, m, n, name)[0] * self.experts_per_gpu
-        gemm_time = grad_time_act + grad_time_wt
-        grad_accum_elems = int(k * n * self.experts_per_gpu)
-        gemm_time += self._grad_accum_time(grad_accum_elems, f"{name}_grad_accum")
-
-        if gemm_type == GemmType.FFN1:
-            per_rank_bytes = math.ceil(self.precision.activations * m * k * self.experts_per_gpu)
-            total_bytes = int(math.ceil(per_rank_bytes * self.cp * self.tp ))
-            reduction_time = self.network_model.collective(
-                kind=ALL_TO_ALL,
-                size_bytes=total_bytes,
-                participants=self.tp * self.cp,
-                ib=self.links["tp"].bandwidth,
-                ll=self.links["tp"].latency,
-                local_bytes=0,
-                debug_label="moe_ffn_b_all_to_all",
-                
+        if batch <= 0 or m <= 0 or k <= 0 or n <= 0:
+            return 0.0, 0.0, 0
+        if use_tp:
+            per_time, per_comm_time, per_comm_bytes = self.parallelism_gemm_backward(
+                (m, k, n),
+                name,
+                gemm_type=gemm_type,
             )
-        
-        return gemm_time, reduction_time, total_bytes
+        else:
+            per_time, per_comm_time, per_comm_bytes = self.single_gpu_gemm_backward(
+                (m, k, n),
+                name,
+                gemm_type=gemm_type,
+            )
+        scale = int(batch)
+        comm_bytes = int(math.ceil(float(per_comm_bytes or 0.0))) * scale
+        comm_time = per_comm_time * scale
+        if use_tp and comm_bytes and scale > 1:
+            fused_time = self._fused_batched_comm_time(comm_bytes, gemm_type, direction="backward")
+            if fused_time:
+                comm_time = fused_time
+        return per_time * scale, comm_time, comm_bytes
+
+    def get_moe_ffn_f(
+        self,
+        gemm,
+        name,
+        gemm_type: Optional[GemmType] = None,
+        *,
+        batch_size: int,
+        seq_len: int,
+        allow_padding: Optional[bool] = None,
+    ):
+        _batch, _m, k, n = self._expand_gemm_descriptor(gemm)
+        if allow_padding is None:
+            allow_padding = self._moe_allow_padding()
+        (
+            tokens_owner,
+            tokens_dispatched,
+            tokens_local,
+            experts_per_rank,
+            tokens_per_expert,
+        ) = self._moe_routed_tokens_per_expert(batch_size, seq_len, allow_padding=allow_padding)
+        tokens_shared = self._moe_tokens_shared(tokens_owner)
+
+        m_per_expert = tokens_per_expert * max(1, int(self.cp))
+        gemm_override = (experts_per_rank, m_per_expert, k, n)
+        use_tp_sharded = bool(getattr(self, "tp_ep", True))
+        gemm_time, tp_comm_time, tp_comm_bytes, total_flops, mem_accesses_total = self._batched_gemm_forward_compute(
+            gemm_override,
+            name,
+            gemm_type=gemm_type,
+            use_tp=use_tp_sharded,
+        )
+
+        if tokens_shared > 0:
+            shared_m = tokens_owner * max(1, int(self.cp))
+            shared_name = f"{name}_shared" if name else "moe_ffn_shared"
+            gemm_override_shared = (int(self.n_shared_experts), shared_m, k, n)
+            (
+                shared_gemm_time,
+                shared_comm_time,
+                shared_comm_bytes,
+                shared_flops,
+                mem_accesses_shared,
+            ) = self._batched_gemm_forward_compute(
+                gemm_override_shared,
+                shared_name,
+                gemm_type=gemm_type,
+                use_tp=use_tp_sharded,
+            )
+            gemm_time += shared_gemm_time
+            tp_comm_time += shared_comm_time
+            tp_comm_bytes += shared_comm_bytes
+            total_flops += shared_flops
+            mem_accesses_total = self._combine_mem(mem_accesses_total, mem_accesses_shared)
+
+        return gemm_time, tp_comm_time, tp_comm_bytes, total_flops, mem_accesses_total
+
+    def get_moe_ffn_b(
+        self,
+        gemm,
+        name,
+        gemm_type,
+        *,
+        batch_size: int,
+        seq_len: int,
+        allow_padding: Optional[bool] = None,
+    ):
+        _batch, _m, k, n = self._expand_gemm_descriptor(gemm)
+        if allow_padding is None:
+            allow_padding = self._moe_allow_padding()
+        (
+            tokens_owner,
+            tokens_dispatched,
+            tokens_local,
+            experts_per_rank,
+            tokens_per_expert,
+        ) = self._moe_routed_tokens_per_expert(batch_size, seq_len, allow_padding=allow_padding)
+        tokens_shared = self._moe_tokens_shared(tokens_owner)
+
+        m_per_expert = tokens_per_expert * max(1, int(self.cp))
+        gemm_override = (experts_per_rank, m_per_expert, k, n)
+        use_tp_sharded = bool(getattr(self, "tp_ep", True))
+        gemm_time, tp_comm_time, tp_comm_bytes = self._batched_gemm_backward_compute(
+            gemm_override,
+            name,
+            gemm_type=gemm_type,
+            use_tp=use_tp_sharded,
+        )
+        if tokens_shared > 0:
+            shared_m = tokens_owner * max(1, int(self.cp))
+            shared_name = f"{name}_shared" if name else "moe_ffn_shared"
+            gemm_override_shared = (int(self.n_shared_experts), shared_m, k, n)
+            shared_gemm_time, shared_comm_time, shared_comm_bytes = self._batched_gemm_backward_compute(
+                gemm_override_shared,
+                shared_name,
+                gemm_type=gemm_type,
+                use_tp=use_tp_sharded,
+            )
+            gemm_time += shared_gemm_time
+            tp_comm_time += shared_comm_time
+            tp_comm_bytes += shared_comm_bytes
+
+        return gemm_time, tp_comm_time, tp_comm_bytes
         
 
                 
@@ -1570,7 +1907,16 @@ class TimeCalculationLLM(TimeCalculation):
         # Residual operates on full tensor, not just GEMM output dimension
         # TODO: double check!
         batch, m, _, n = self._expand_gemm_descriptor(tensor_shape)
-        elements = batch * m * n
+        elements_m = m
+        mode = self.get_parallelism_mode()
+        if mode in (
+            ParallelismMode.TENSOR_SEQUENCE,
+            ParallelismMode.CONTEXT,
+            ParallelismMode.TENSOR_CONTEXT_HYBRID,
+        ):
+            seq_degree = max(1, int(self._sequence_parallel_degree()))
+            elements_m = math.ceil(m / seq_degree)
+        elements = batch * elements_m * n
 
         flops = 2 * elements  # add + bias
         mem = self.precision.activations * elements * 3  # read main, read residual, write out
@@ -1590,7 +1936,16 @@ class TimeCalculationLLM(TimeCalculation):
         # Residual operates on full tensor, not just GEMM output dimension
         # TODO: double check!
         batch, m, _, n = self._expand_gemm_descriptor(tensor_shape)
-        elements = batch * m * n
+        elements_m = m
+        mode = self.get_parallelism_mode()
+        if mode in (
+            ParallelismMode.TENSOR_SEQUENCE,
+            ParallelismMode.CONTEXT,
+            ParallelismMode.TENSOR_CONTEXT_HYBRID,
+        ):
+            seq_degree = max(1, int(self._sequence_parallel_degree()))
+            elements_m = math.ceil(m / seq_degree)
+        elements = batch * elements_m * n
 
         flops = elements  # dL/dx = dL/dy passthrough
         mem = self.precision.gradients * elements * 3  # read grad, read forward residual, write grad
@@ -1700,7 +2055,7 @@ class TimeCalculationLLM(TimeCalculation):
         ) + 3 * self.O
         if tp_mode in (ParallelismMode.TENSOR_SEQUENCE, ParallelismMode.TENSOR_CONTEXT_HYBRID):  # all-gather after layernorm
             per_rank_bytes = self.precision.stats * elements
-            total_bytes = int(math.ceil(per_rank_bytes * self.tp))
+            total_bytes = int(math.ceil(per_rank_bytes))
             reduction_time = self.network_model.collective(
                 kind=ALL_GATHER,
                 size_bytes=total_bytes,
@@ -1736,23 +2091,9 @@ class TimeCalculationLLM(TimeCalculation):
             mem_level=self.num_levels - 1,
         ) + 4 * self.O
         compute_time += self._grad_accum_time(2 * d_model, "layernorm_grad_accum")
-        if self.use_moe and type == GemmType.LAYER_NORM_1:  # communication after layernorm
-            per_rank_bytes = self.precision.grad_communication * elements * self.moe_top_k
-            total_bytes = int(math.ceil(per_rank_bytes * self.tp * self.cp))
-            
-            reduction_time = self.network_model.collective(
-                kind=ALL_TO_ALL,
-                size_bytes=total_bytes,
-                participants=self.tp * self.cp,
-                ib=self.links["tp"].bandwidth,
-                ll=self.links["tp"].latency,
-                local_bytes=0,
-                debug_label="layernorm_b_all_to_all",
-            )
-
-        elif tp_mode in (ParallelismMode.TENSOR_SEQUENCE, ParallelismMode.TENSOR_CONTEXT_HYBRID) :
+        if tp_mode in (ParallelismMode.TENSOR_SEQUENCE, ParallelismMode.TENSOR_CONTEXT_HYBRID) :
             per_rank_bytes = self.precision.grad_communication * elements
-            total_bytes = int(math.ceil(per_rank_bytes * self.tp))
+            total_bytes = int(math.ceil(per_rank_bytes))
             reduction_time = self.network_model.collective(
                 kind=ALL_GATHER,
                 size_bytes=total_bytes,
@@ -1770,57 +2111,33 @@ class TimeCalculationLLM(TimeCalculation):
 
 
         return compute_time, reduction_time, total_bytes
-    def get_router_f(self, gemm_router, gemm_ffn1):
+    def get_router_f(self, gemm_router, gemm_ffn1, *, batch_size: int, seq_len: int):
         #TODO router overhead for moe is very minimal, can be ignored, implemented for completeness
-        _, effective_m, k, n = self._effective_dims(gemm_router)
-        effective_m = effective_m / (self.cp)
-        gemm_time = self.single_gpu_gemm_forward(gemm_router, "router_f")[0]
-        elements = effective_m * n
+        tokens_owner = self._moe_tokens_owner(batch_size, seq_len)
+        _batch, _m, k, n = self._expand_gemm_descriptor(gemm_router)
+        gemm_time = self.get_gemm_time(tokens_owner, k, n, "router_f")[0]
+        elements = tokens_owner * n
         flops = elements * SOFTMAX_FORWARD_FLOPS_PER_ELEMENT
         mem_bytes = self.precision.activations * elements * SOFTMAX_FORWARD_MEM_ACCESSES  
 
         compute_time = gemm_time + self.roofline(flops, mem_bytes, name="pointwise-router-f", mem_level=self.num_levels - 1) + self.O
 
-        per_rank_bytes = math.ceil(self.precision.activations * gemm_ffn1[0] * gemm_ffn1[1] * self.experts_per_gpu)
-        total_bytes = int(math.ceil(per_rank_bytes * self.cp * self.tp )) 
-        reduction_time = self.network_model.collective(
-            kind=ALL_TO_ALL,
-            size_bytes=total_bytes,
-            participants = self.tp * self.cp,
-            ib=self.links["tp"].bandwidth,
-            ll=self.links["tp"].latency,
-            local_bytes=0,
-            debug_label="router_f_all_to_all",
-        )
-
-
-        return compute_time, reduction_time, total_bytes
-    def get_router_b(self, gemm_router, gemm_ffn1):
+        return compute_time, 0.0, 0
+    def get_router_b(self, gemm_router, gemm_ffn1, *, batch_size: int, seq_len: int):
         #TODO router overhead for moe is very minimal, can be ignored, implemented for completeness
-        _, effective_m, k, n = self._effective_dims(gemm_router)
-        elements = effective_m * k / (self.tp * self.cp)
+        tokens_owner = self._moe_tokens_owner(batch_size, seq_len)
+        _batch, _m, k, n = self._expand_gemm_descriptor(gemm_router)
 
-        gemm_time = self.single_gpu_gemm_backward(gemm_router, "router_f")[0]
+        grad_time_act = self.get_gemm_time(tokens_owner, n, k, "router_b")[0]
+        grad_time_wt = self.get_gemm_time(k, tokens_owner, n, "router_b")[0]
+        gemm_time = grad_time_act + grad_time_wt
 
+        elements = tokens_owner * n
         flops = elements * SOFTMAX_BACKWARD_FLOPS_PER_ELEMENT
         mem_bytes = self.precision.activations * elements * SOFTMAX_BACKWARD_MEM_ACCESSES
 
-        compute_time = gemm_time + self.roofline(flops, mem_bytes, name="pointwise-router-f", mem_level=self.num_levels - 1) + self.O
-        bytes_per_rank = math.ceil(self.precision.activations * elements)
-
-        total_bytes = int(math.ceil(bytes_per_rank * self.tp))
-        reduction_time = self.network_model.collective(
-            kind=REDUCE_SCATTER,
-            size_bytes=total_bytes,
-            participants=self.tp ,
-            ib=self.links["tp"].bandwidth,
-            ll=self.links["tp"].latency,
-            local_bytes=0,
-            debug_label="router_b_reduce_scatter",
-        )
-
-
-        return compute_time, reduction_time, total_bytes
+        compute_time = gemm_time + self.roofline(flops, mem_bytes, name="pointwise-router-b", mem_level=self.num_levels - 1) + self.O
+        return compute_time, 0.0, 0
     
     def get_embedding_b(self, vocab_size, seq_len, hidden_dim):
         batch = self._effective_transformer_batch()
@@ -1842,37 +2159,105 @@ class TimeCalculationLLM(TimeCalculation):
     def get_inter_layer_comm_latency_llm(self, batch_size, hidden_dim, seq_len): #calculate the cross-layer communication latency
         w = 0
         w_size = 0
-        if self.lp > 1:
+        if self.pp > 1:
             w_size = self.precision.activations * batch_size * hidden_dim * seq_len
-            transfer_time = w_size / self.links["lp"].bandwidth + self.links["lp"].latency
+            transfer_time = w_size / self.links["pp"].bandwidth + self.links["pp"].latency
             mem_time = self.roofline(0, 2 * w_size, name="inter_layer", mem_level=self.num_levels - 1)
             # 2: read from memory of previous layer and write to the memory of the next layer
             w = mem_time + transfer_time
         return w, w_size
 
-    def get_data_parallel_reduction_sizes(self, d, intermediate_size):
+    def get_data_parallel_reduction_sizes(self, d, intermediate_size, *, moe: bool = False):
         """Calculate communication sizes for data parallel reductions (no timing)."""
         if not getattr(self, "dp", 1) or self.dp <= 1:
             # No communication needed for dp=1
             return 0
 
         # Calculate sizes only
-        qkv_size = math.ceil(self.precision.grad_communication * d * 3 * d)
-        output_size = math.ceil(self.precision.grad_communication * d * d)
-        ffn1_dim = self._ffn1_output_dim(intermediate_size)
-        ffn1_size = math.ceil(self.precision.grad_communication * ffn1_dim * d)
-        ffn2_size = math.ceil(self.precision.grad_communication * intermediate_size * d)
-        total_size = qkv_size + output_size + ffn1_size + ffn2_size
+        if llm_util.is_glm_style(self.model_type):
+            _head_dim, q_size, kv_size = llm_util.attention_dim_sizes(
+                d,
+                self.num_heads,
+                self.kv_heads,
+                head_dim=getattr(self, "head_dim", None),
+            )
+            qkv_params = d * (q_size + 2 * kv_size)
+            output_params = q_size * d
+        else:
+            qkv_params = d * 3 * d
+            output_params = d * d
+        qkv_size = math.ceil(self.precision.grad_communication * qkv_params)
+        output_size = math.ceil(self.precision.grad_communication * output_params)
+        if not moe:
+            ffn1_dim = self._ffn1_output_dim(intermediate_size)
+            ffn1_size = math.ceil(self.precision.grad_communication * ffn1_dim * d)
+            ffn2_size = math.ceil(self.precision.grad_communication * intermediate_size * d)
+            total_size = qkv_size + output_size + ffn1_size + ffn2_size
+            return total_size
 
+        ffn_proj_factor = 3 if llm_util.is_llama_style(self.model_type) else 2
+        expert_param_size = ffn_proj_factor * intermediate_size * d
+        tp = max(1, int(self.tp))
+        moe_group = max(1, int(self._moe_routing_group()))
+        routed_experts_per_rank = self.moe_num_experts / moe_group
+        shared_experts_per_rank = self.n_shared_experts
+        use_tp_sharded = bool(getattr(self, "tp_ep", True))
+        if use_tp_sharded:
+            routed_params_per_rank = (expert_param_size / tp) * routed_experts_per_rank
+        else:
+            routed_params_per_rank = expert_param_size * routed_experts_per_rank
+        if use_tp_sharded:
+            shared_params_per_rank = (expert_param_size / tp) * shared_experts_per_rank
+        else:
+            shared_params_per_rank = expert_param_size * shared_experts_per_rank
+        expert_params_per_rank = routed_params_per_rank + shared_params_per_rank
+        router_params_per_rank = d * self.moe_num_experts
+        moe_param_size = math.ceil(
+            self.precision.grad_communication * (expert_params_per_rank + router_params_per_rank)
+        )
+        total_size = qkv_size + output_size + moe_param_size
         return total_size
 
-    def get_data_parallel_reduction_llm(self, d, intermediate_size):
+    def get_data_parallel_reduction_llm(self, d, intermediate_size, *, moe: bool = False):
         """Return apply_grad compute time per rank (no communication), honoring ZeRO sharding."""
-        apply_grad_time = self.apply_grad(int(d * 3 * d)) # QKV
-        apply_grad_time += self.apply_grad(int(d * d)) # Output
-        ffn1_dim = self._ffn1_output_dim(intermediate_size)
-        apply_grad_time += self.apply_grad(int(ffn1_dim * d)) # FFN1
-        apply_grad_time += self.apply_grad(int(intermediate_size * d)) # FFN2
+        if llm_util.is_glm_style(self.model_type):
+            _head_dim, q_size, kv_size = llm_util.attention_dim_sizes(
+                d,
+                self.num_heads,
+                self.kv_heads,
+                head_dim=getattr(self, "head_dim", None),
+            )
+            qkv_params = d * (q_size + 2 * kv_size)
+            output_params = q_size * d
+        else:
+            qkv_params = d * 3 * d
+            output_params = d * d
+        apply_grad_time = self.apply_grad(int(qkv_params)) # QKV
+        apply_grad_time += self.apply_grad(int(output_params)) # Output
+        if not moe:
+            ffn1_dim = self._ffn1_output_dim(intermediate_size)
+            apply_grad_time += self.apply_grad(int(ffn1_dim * d)) # FFN1
+            apply_grad_time += self.apply_grad(int(intermediate_size * d)) # FFN2
+        else:
+            ffn_proj_factor = 3 if llm_util.is_llama_style(self.model_type) else 2
+            expert_param_size = ffn_proj_factor * intermediate_size * d
+            tp = max(1, int(self.tp))
+            moe_group = max(1, int(self._moe_routing_group()))
+            routed_experts_per_rank = self.moe_num_experts / moe_group
+            shared_experts_per_rank = self.n_shared_experts
+            use_tp_sharded = bool(getattr(self, "tp_ep", True))
+            if use_tp_sharded:
+                routed_params_per_rank = (expert_param_size / tp) * routed_experts_per_rank
+            else:
+                routed_params_per_rank = expert_param_size * routed_experts_per_rank
+            if use_tp_sharded:
+                shared_params_per_rank = (expert_param_size / tp) * shared_experts_per_rank
+            else:
+                shared_params_per_rank = expert_param_size * shared_experts_per_rank
+            expert_params_per_rank = routed_params_per_rank + shared_params_per_rank
+            apply_grad_time += self.apply_grad(int(expert_params_per_rank))
+            router_params_per_rank = d * self.moe_num_experts
+            apply_grad_time += self.apply_grad(int(router_params_per_rank)) # Router
 
         grad_shard = self.dp if (self.zero_stage >= 2 and self.dp > 1) else 1
         if grad_shard > 1:
@@ -1913,11 +2298,26 @@ class TimeCalculationLLM(TimeCalculation):
         kv_heads,
         intermediate_size,
         num_SMs,
+        use_moe_override: Optional[bool] = None,
     ):
         """Compute latency for all GEMM operations and node breakdown times."""
 
+        use_moe_layer = self.use_moe if use_moe_override is None else bool(use_moe_override)
+        gemm_ctx = self
+        if use_moe_layer != self.use_moe:
+            from types import SimpleNamespace
+
+            gemm_ctx = SimpleNamespace(
+                use_moe=use_moe_layer,
+                moe_num_experts=self.moe_num_experts,
+                moe_top_k=self.moe_top_k,
+                moe_intermediate_size=intermediate_size,
+                model_type=self.model_type,
+                head_dim=getattr(self, "head_dim", None),
+            )
+
         gemm_shapes = llm_util.process_gemm_shapes(
-            self,
+            gemm_ctx,
             batch_size,
             seq_len,
             hidden_dim,
@@ -1937,6 +2337,10 @@ class TimeCalculationLLM(TimeCalculation):
         gemm_router = gemm_shapes["router"]
 
         transformer_timings: Dict[str, OperationTiming] = {}
+        moe_tokens_owner: Optional[int] = None
+        moe_tokens_dispatched: Optional[int] = None
+        moe_tokens_local: Optional[int] = None
+        moe_tokens_shared: Optional[int] = None
 
         def _extract_forward(ret: Sequence[Any]) -> Tuple[float, float, float, float, Any]:
             if len(ret) == 5:
@@ -2119,7 +2523,7 @@ class TimeCalculationLLM(TimeCalculation):
                 comm_bytes=int(out_proj_size_b or 0),
             ),
         )
-        if not self.use_moe: 
+        if not use_moe_layer: 
             ffn1_gemm_f, ffn1_reduction_f, ffn1_size_f, ffn1_flops_f, ffn1_mem_f = _extract_forward(
                 self.parallelism_gemm_forward(gemm_ffn1, "ffn_f", gemm_type=GemmType.FFN1)
             )
@@ -2134,17 +2538,106 @@ class TimeCalculationLLM(TimeCalculation):
             )
 
         else: # MOE expert parallelism
-            router_gemm_time_f , router_reduction_f, router_size_f, _, _ = _extract_forward(self.get_router_f(gemm_router, gemm_ffn1))
-            router_gemm_time_b , router_reduction_b, router_size_b= self.get_router_b(gemm_router, gemm_ffn1)
+            allow_padding = self._moe_allow_padding()
+            (
+                moe_tokens_owner,
+                moe_tokens_dispatched,
+                moe_tokens_local,
+                _experts_per_rank,
+                _tokens_per_expert,
+            ) = self._moe_routed_tokens_per_expert(batch_size, seq_len, allow_padding=allow_padding)
+            moe_tokens_shared = self._moe_tokens_shared(moe_tokens_owner)
+            router_gemm_time_f , router_reduction_f, router_size_f, _, _ = _extract_forward(
+                self.get_router_f(gemm_router, gemm_ffn1, batch_size=batch_size, seq_len=seq_len)
+            )
+            router_gemm_time_b , router_reduction_b, router_size_b= self.get_router_b(
+                gemm_router, gemm_ffn1, batch_size=batch_size, seq_len=seq_len
+            )
+            moe_group = self._moe_routing_group()
+            axis = "ep" if moe_group == self.ep else None
+            dispatch_fwd_bytes = int(
+                math.ceil(self.precision.activations * moe_tokens_dispatched * hidden_dim)
+            )
+            dispatch_bwd_bytes = int(
+                math.ceil(self.precision.grad_communication * moe_tokens_dispatched * hidden_dim)
+            )
+            dispatch_fwd_time = self.network_model.collective(
+                kind=ALL_TO_ALL,
+                size_bytes=dispatch_fwd_bytes,
+                participants=moe_group,
+                ib=self.links["ep"].bandwidth,
+                ll=self.links["ep"].latency,
+                local_bytes=0,
+                debug_label="moe_dispatch_f_all_to_all",
+                axis=axis,
+            )
+            dispatch_bwd_time = self.network_model.collective(
+                kind=ALL_TO_ALL,
+                size_bytes=dispatch_bwd_bytes,
+                participants=moe_group,
+                ib=self.links["ep"].bandwidth,
+                ll=self.links["ep"].latency,
+                local_bytes=0,
+                debug_label="moe_dispatch_b_all_to_all",
+                axis=axis,
+            )
             ffn1_gemm_f, ffn1_reduction_f, ffn1_size_f, ffn1_flops_f, ffn1_mem_f = _extract_forward(
-                self.get_moe_ffn_f(gemm_ffn1, "ffn1_f", gemm_type=GemmType.FFN1)
+                self.get_moe_ffn_f(
+                    gemm_ffn1,
+                    "ffn1_f",
+                    gemm_type=GemmType.FFN1,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    allow_padding=allow_padding,
+                )
             )
-            ffn1_gemm_b, ffn1_reduction_b, ffn1_size_b = self.get_moe_ffn_b(gemm_ffn1, "ffn1_b", gemm_type=GemmType.FFN1)
+            ffn1_gemm_b, ffn1_reduction_b, ffn1_size_b = self.get_moe_ffn_b(
+                gemm_ffn1,
+                "ffn1_b",
+                gemm_type=GemmType.FFN1,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                allow_padding=allow_padding,
+            )
+            combine_fwd_time = self.network_model.collective(
+                kind=ALL_TO_ALL,
+                size_bytes=dispatch_fwd_bytes,
+                participants=moe_group,
+                ib=self.links["ep"].bandwidth,
+                ll=self.links["ep"].latency,
+                local_bytes=0,
+                debug_label="moe_combine_f_all_to_all",
+                axis=axis,
+            )
+            combine_bwd_time = self.network_model.collective(
+                kind=ALL_TO_ALL,
+                size_bytes=dispatch_bwd_bytes,
+                participants=moe_group,
+                ib=self.links["ep"].bandwidth,
+                ll=self.links["ep"].latency,
+                local_bytes=0,
+                debug_label="moe_combine_b_all_to_all",
+                axis=axis,
+            )
             ffn2_gemm_f, ffn2_reduction_f, ffn2_size_f, ffn2_flops_f, ffn2_mem_f = _extract_forward(
-                self.get_moe_ffn_f(gemm_ffn2, "ffn2_f", gemm_type=GemmType.FFN2)
+                self.get_moe_ffn_f(
+                    gemm_ffn2,
+                    "ffn2_f",
+                    gemm_type=GemmType.FFN2,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    allow_padding=allow_padding,
+                )
             )
-            ffn2_gemm_b, ffn2_reduction_b, ffn2_size_b = self.get_moe_ffn_b(gemm_ffn2, "ffn2_b", gemm_type=GemmType.FFN2)
-        if self.use_moe:
+            ffn2_gemm_b, ffn2_reduction_b, ffn2_size_b = self.get_moe_ffn_b(
+                gemm_ffn2,
+                "ffn2_b",
+                gemm_type=GemmType.FFN2,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                allow_padding=allow_padding,
+            )
+        if use_moe_layer:
             transformer_timings["router"] = OperationTiming(
                 "router",
                 forward=DirectionTiming(
@@ -2156,6 +2649,32 @@ class TimeCalculationLLM(TimeCalculation):
                     compute_time=router_gemm_time_b,
                     comm_time=router_reduction_b,
                     comm_bytes=int(router_size_b or 0),
+                ),
+            )
+            transformer_timings["moe_dispatch"] = OperationTiming(
+                "moe_dispatch",
+                forward=DirectionTiming(
+                    compute_time=0.0,
+                    comm_time=dispatch_fwd_time,
+                    comm_bytes=int(dispatch_fwd_bytes or 0),
+                ),
+                backward=DirectionTiming(
+                    compute_time=0.0,
+                    comm_time=dispatch_bwd_time,
+                    comm_bytes=int(dispatch_bwd_bytes or 0),
+                ),
+            )
+            transformer_timings["moe_combine"] = OperationTiming(
+                "moe_combine",
+                forward=DirectionTiming(
+                    compute_time=0.0,
+                    comm_time=combine_fwd_time,
+                    comm_bytes=int(dispatch_fwd_bytes or 0),
+                ),
+                backward=DirectionTiming(
+                    compute_time=0.0,
+                    comm_time=combine_bwd_time,
+                    comm_bytes=int(dispatch_bwd_bytes or 0),
                 ),
             )
         
@@ -2262,12 +2781,33 @@ class TimeCalculationLLM(TimeCalculation):
             ),
         )
 
-        if self.model_type == "llama":
-            act_f = self.get_swiglu_f(tensor_shape=gemm_ffn1)
-            act_b = self.get_swiglu_b(tensor_shape=gemm_ffn1)
+        ffn1_spec = self._shard_gemm_descriptor(gemm_ffn1, GemmType.FFN1)
+        ffn1_activation_shape = (ffn1_spec.shard_m, ffn1_spec.k, ffn1_spec.shard_n)
+        ffn1_activation_shape_shared = None
+        if use_moe_layer:
+            tokens_owner = moe_tokens_owner if moe_tokens_owner is not None else self._moe_tokens_owner(batch_size, seq_len)
+            tokens_local = moe_tokens_local if moe_tokens_local is not None else self._moe_tokens_local(
+                self._moe_tokens_dispatched(tokens_owner)
+            )
+            tokens_shared = moe_tokens_shared if moe_tokens_shared is not None else self._moe_tokens_shared(tokens_owner)
+            use_tp_sharded = bool(getattr(self, "tp_ep", True))
+            ffn1_n = ffn1_spec.shard_n if use_tp_sharded else ffn1_spec.n
+            ffn1_activation_shape = (tokens_local, ffn1_spec.k, ffn1_n)
+            if tokens_shared > 0:
+                ffn1_activation_shape_shared = (tokens_shared, ffn1_spec.k, ffn1_n)
+
+        if llm_util.is_llama_style(self.model_type):
+            act_f = self.get_swiglu_f(tensor_shape=ffn1_activation_shape)
+            act_b = self.get_swiglu_b(tensor_shape=ffn1_activation_shape)
+            if ffn1_activation_shape_shared is not None:
+                act_f += self.get_swiglu_f(tensor_shape=ffn1_activation_shape_shared)
+                act_b += self.get_swiglu_b(tensor_shape=ffn1_activation_shape_shared)
         else:
-            act_f = self.get_gelu_f(tensor_shape=gemm_ffn1)
-            act_b = self.get_gelu_b(tensor_shape=gemm_ffn1)
+            act_f = self.get_gelu_f(tensor_shape=ffn1_activation_shape)
+            act_b = self.get_gelu_b(tensor_shape=ffn1_activation_shape)
+            if ffn1_activation_shape_shared is not None:
+                act_f += self.get_gelu_f(tensor_shape=ffn1_activation_shape_shared)
+                act_b += self.get_gelu_b(tensor_shape=ffn1_activation_shape_shared)
         transformer_timings["gelu"] = OperationTiming(
             "gelu",
             forward=DirectionTiming(compute_time=act_f, comm_time=0.0, comm_bytes=0),
@@ -2316,6 +2856,11 @@ class TimeCalculationLLM(TimeCalculation):
             + transformer_timings["layernorm1"].total_backward_time()
             + transformer_timings["layernorm2"].total_backward_time()
         )
+        if use_moe_layer:
+            for op_name in ("router", "moe_dispatch", "moe_combine"):
+                if op_name in transformer_timings:
+                    transformer_time_f += transformer_timings[op_name].total_forward_time()
+                    transformer_time_b += transformer_timings[op_name].total_backward_time()
         # Pipeline-style recompute uses explicit recompute nodes, so keep backward time as-is.
         transformer_time_b_combined = transformer_time_b
 
@@ -2348,19 +2893,29 @@ class TimeCalculationLLM(TimeCalculation):
 
 
     def _effective_transformer_batch(self) -> int:
-        if self.lp > 1:
+        run_type = str(getattr(getattr(self, "model", None), "run_type", "training")).lower()
+        if run_type == "inference":
+            if self.pp > 1:
+                return self.micro_batch
+            return self.batch_size
+        if self.pp > 1:
             return self.micro_batch
-        if self.dp > 1:
+        dp_dense = self.dp * self.ep if self.use_moe else self.dp
+        if dp_dense > 1:
             return self.mini_batch
         return self.batch_size
 
     def _build_comm_metadata(
         self,
-        reduction_sizes: Dict[str, int],
-        local_comp: Dict[str, float], 
+        reduction_sizes_dense: float,
+        reduction_sizes_moe: float,
+        local_comp_dense: float,
+        local_comp_moe: float,
         embedding_size: int,
         softmax_size: int,
         cross_layer_bytes: int,
+        transformer_dense_ep_sync_bytes: float = 0.0,
+        transformer_moe_ep_sync_bytes: float = 0.0,
         zero2_embedding_gather_bytes: float = 0.0,
         zero2_transformer_gather_bytes: float = 0.0,
         zero2_softmax_gather_bytes: float = 0.0,
@@ -2370,12 +2925,19 @@ class TimeCalculationLLM(TimeCalculation):
     ) -> Dict[str, Dict[str, Any]]:
         grad_collective = REDUCE_SCATTER if (self.zero_stage >= 2 and self.dp > 1) else ALL_REDUCE
         metadata = {
-            'transformer': {
-                'size': reduction_sizes,
+            'transformer_dense': {
+                'size': reduction_sizes_dense,
                 'type': grad_collective,
                 'participants': self.dp,
                 'interconnect_type': 'dp',
-                'local_comp_time': local_comp
+                'local_comp_time': local_comp_dense,
+            },
+            'transformer_moe': {
+                'size': reduction_sizes_moe,
+                'type': grad_collective,
+                'participants': self.dp,
+                'interconnect_type': 'dp',
+                'local_comp_time': local_comp_moe,
             },
             'embedding': {
                 'size': embedding_size,
@@ -2395,10 +2957,26 @@ class TimeCalculationLLM(TimeCalculation):
                 'size': cross_layer_bytes,
                 'type': PIPELINE,
                 'participants': 2,
-                'interconnect_type': 'lp',
+                'interconnect_type': 'pp',
                 'local_comp_time': 0
             }
         }
+        if transformer_dense_ep_sync_bytes and self.ep > 1:
+            metadata['transformer_dense_ep_sync'] = {
+                'size': int(math.ceil(transformer_dense_ep_sync_bytes)),
+                'type': grad_collective,
+                'participants': self.ep,
+                'interconnect_type': 'ep',
+                'local_comp_time': 0,
+            }
+        if transformer_moe_ep_sync_bytes and self.ep > 1:
+            metadata['transformer_moe_ep_sync'] = {
+                'size': int(math.ceil(transformer_moe_ep_sync_bytes)),
+                'type': grad_collective,
+                'participants': self.ep,
+                'interconnect_type': 'ep',
+                'local_comp_time': 0,
+            }
         if zero2_embedding_gather_bytes:
             metadata['zero2_embedding_gather'] = {
                 'size': int(math.ceil(zero2_embedding_gather_bytes)),
@@ -2453,7 +3031,8 @@ class TimeCalculationLLM(TimeCalculation):
     def _build_interconnect_params(self) -> Dict[str, Tuple[float, float]]:
         return {
             'dp': (self.links["dp"].bandwidth, self.links["dp"].latency),
-            'lp': (self.links["lp"].bandwidth, self.links["lp"].latency),
+            'ep': (self.links["ep"].bandwidth, self.links["ep"].latency),
+            'pp': (self.links["pp"].bandwidth, self.links["pp"].latency),
             'tp': (self.links["tp"].bandwidth, self.links["tp"].latency),
             'cp': (self.links["cp"].bandwidth, self.links["cp"].latency),
         }
@@ -2464,6 +3043,8 @@ class TimeCalculationLLM(TimeCalculation):
         *,
         node_breakdown: Dict[str, float],
         transformer_timings: Dict[str, OperationTiming],
+        moe_node_breakdown: Optional[Dict[str, float]] = None,
+        moe_transformer_timings: Optional[Dict[str, OperationTiming]] = None,
         batch_size: int,
         seq_len: int,
         hidden_dim: int,
@@ -2483,32 +3064,89 @@ class TimeCalculationLLM(TimeCalculation):
         Any,
         Optional[Graph],
         Optional[Any],
-        Optional[Any],
-        Dict[str, Tuple[float, float]],
         Optional[Graph],
         Optional[Any],
+        Optional[Any],
+        Optional[Graph],
+        Optional[Any],
+        Optional[Any],
+        Dict[str, Tuple[float, float]],
     ]:
         """Build pipeline/transformer graphs shared across training and inference."""
+        need_no_dp_variant = getattr(self, "gradient_accumulation_steps", 1) > 1
 
         if not include_pipeline_backward and not include_transformer_backward:
             # Forward-only inference: skip training all-reduce bookkeeping.
-            reduction_sizes = 0.0
-            local_comp = 0.0
+            reduction_sizes_dense = 0.0
+            reduction_sizes_moe = 0.0
+            local_comp_dense = 0.0
+            local_comp_moe = 0.0
         else:
-            reduction_sizes = self.get_data_parallel_reduction_sizes(hidden_dim, intermediate_size)
-            local_comp = self.get_data_parallel_reduction_llm(hidden_dim, intermediate_size)
+            reduction_sizes_dense = self.get_data_parallel_reduction_sizes(hidden_dim, intermediate_size, moe=False)
+            local_comp_dense = self.get_data_parallel_reduction_llm(hidden_dim, intermediate_size, moe=False)
+            reduction_sizes_moe = reduction_sizes_dense
+            local_comp_moe = local_comp_dense
+            if self.use_moe:
+                reduction_sizes_moe = self.get_data_parallel_reduction_sizes(
+                    hidden_dim,
+                    self.moe_intermediate_size,
+                    moe=True,
+                )
+                local_comp_moe = self.get_data_parallel_reduction_llm(
+                    hidden_dim,
+                    self.moe_intermediate_size,
+                    moe=True,
+                )
 
         # these are used for dp all-reduce/reduce-scatter.
         embedding_size = math.ceil(self.precision.grad_communication * vocab_size * hidden_dim) + math.ceil(self.precision.grad_communication * seq_len * hidden_dim * batch_size)
         softmax_size = math.ceil(self.precision.grad_communication * hidden_dim * vocab_size)
         cross_layer_bytes = self.get_inter_layer_comm_latency_llm(batch_size, hidden_dim, seq_len)[1]
 
+        ep_dense_sync_bytes_dense = 0
+        ep_dense_sync_bytes_moe = 0
+        if include_transformer_backward and self.use_moe and self.ep > 1:
+            if llm_util.is_glm_style(self.model_type):
+                _head_dim, q_size, kv_size = llm_util.attention_dim_sizes(
+                    hidden_dim,
+                    self.num_heads,
+                    self.kv_heads,
+                    head_dim=getattr(self, "head_dim", None),
+                )
+                qkv_params = hidden_dim * (q_size + 2 * kv_size)
+                output_params = q_size * hidden_dim
+            else:
+                qkv_params = hidden_dim * 3 * hidden_dim
+                output_params = hidden_dim * hidden_dim
+            qkv_size = math.ceil(self.precision.grad_communication * qkv_params)
+            output_size = math.ceil(self.precision.grad_communication * output_params)
+            ffn1_dim = self._ffn1_output_dim(intermediate_size)
+            ffn1_size = math.ceil(self.precision.grad_communication * ffn1_dim * hidden_dim)
+            ffn2_size = math.ceil(self.precision.grad_communication * intermediate_size * hidden_dim)
+            ep_dense_sync_bytes_dense = int(qkv_size + output_size + ffn1_size + ffn2_size)
+            router_size = math.ceil(self.precision.grad_communication * hidden_dim * self.moe_num_experts)
+            shared_size = 0
+            if self.n_shared_experts > 0:
+                ffn_proj_factor = 3 if llm_util.is_llama_style(self.model_type) else 2
+                expert_param_size = ffn_proj_factor * self.moe_intermediate_size * hidden_dim
+                use_tp_sharded = bool(getattr(self, "tp_ep", True))
+                if use_tp_sharded:
+                    shared_params_per_rank = (expert_param_size / max(1, self.tp)) * self.n_shared_experts
+                else:
+                    shared_params_per_rank = expert_param_size * self.n_shared_experts
+                shared_size = math.ceil(self.precision.grad_communication * shared_params_per_rank)
+            ep_dense_sync_bytes_moe = int(qkv_size + output_size + router_size + shared_size)
+
         comm_metadata = self._build_comm_metadata(
-            reduction_sizes=reduction_sizes,
-            local_comp=local_comp, 
+            reduction_sizes_dense=reduction_sizes_dense,
+            reduction_sizes_moe=reduction_sizes_moe,
+            local_comp_dense=local_comp_dense,
+            local_comp_moe=local_comp_moe,
             embedding_size=embedding_size,
             softmax_size=softmax_size,
             cross_layer_bytes=cross_layer_bytes,
+            transformer_dense_ep_sync_bytes=ep_dense_sync_bytes_dense,
+            transformer_moe_ep_sync_bytes=ep_dense_sync_bytes_moe,
             zero2_embedding_gather_bytes=zero2_embedding_gather_bytes,
             zero2_transformer_gather_bytes=zero2_transformer_gather_bytes,
             zero2_softmax_gather_bytes=zero2_softmax_gather_bytes,
@@ -2516,9 +3154,8 @@ class TimeCalculationLLM(TimeCalculation):
             zero3_transformer_gather_bytes=zero3_transformer_gather_bytes,
             zero3_softmax_gather_bytes=zero3_softmax_gather_bytes,
         )
+        grad_collective = REDUCE_SCATTER if (self.zero_stage >= 2 and self.dp > 1) else ALL_REDUCE
 
-        transformer_operation_entries: List[Dict[str, Any]] = []
-        transformer_comm_metadata: Dict[str, Dict[str, Any]] = {}
         parallelism_mode = self.get_parallelism_mode()
         def _clone_comm_rules(rules: Dict[str, Dict[str, Optional[Dict[str, str]]]]) -> Dict[str, Dict[str, Optional[Dict[str, str]]]]:
             cloned: Dict[str, Dict[str, Optional[Dict[str, str]]]] = {}
@@ -2528,9 +3165,12 @@ class TimeCalculationLLM(TimeCalculation):
                     cloned[op_name][direction] = dict(spec) if spec else None
             return cloned
 
-        def _resolve_comm_rules(mode: ParallelismMode) -> Dict[str, Dict[str, Optional[Dict[str, str]]]]:
+        def _resolve_comm_rules(
+            mode: ParallelismMode,
+            use_moe_layer: bool,
+        ) -> Dict[str, Dict[str, Optional[Dict[str, str]]]]:
             base_rules = COMMUNICATION_RULES.get(mode) or {}
-            if not self.use_moe:
+            if not use_moe_layer:
                 return base_rules
             overrides = MOE_COMMUNICATION_RULES.get(mode)
             if not overrides:
@@ -2542,201 +3182,387 @@ class TimeCalculationLLM(TimeCalculation):
                     merged[op_name][direction] = dict(spec) if spec else None
             return merged
 
-        rules_by_mode = _resolve_comm_rules(parallelism_mode)
-        participants_lookup = {
+        graph_ep = self.ep if self.use_moe else 1
+        participants_lookup_base = {
             'tp': int(getattr(self, 'tp', 0) or 0),
             'cp': int(getattr(self, 'cp', 0) or 0),
+            'ep': int(graph_ep or 0),
             'dp': int(getattr(self, 'dp', 0) or 0),
-            'lp': int(getattr(self, 'lp', 0) or 0),
+            'pp': int(getattr(self, 'pp', 0) or 0),
         }
-        participants_lookup['moe'] = max(1, participants_lookup['tp'] * participants_lookup['cp'])
         group_members = {
             "MLP": ("ffn1", "gelu", "ffn2"),
         }
+        def _build_transformer_graph(
+            transformer_timings_local: Dict[str, OperationTiming],
+            *,
+            use_moe_layer: bool,
+            ep_dense_sync_bytes: int,
+        ) -> Tuple[Optional[Graph], Optional[Any], Optional[Any]]:
+            participants_lookup = dict(participants_lookup_base)
+            if use_moe_layer:
+                participants_lookup["ep"] = int(self._moe_routing_group())
+            transformer_operation_entries: List[Dict[str, Any]] = []
+            transformer_comm_metadata: Dict[str, Dict[str, Any]] = {}
+            rules_by_mode = _resolve_comm_rules(parallelism_mode, use_moe_layer)
 
-        def _register_specs(specs: Sequence[CommSpec]) -> List[str]:
-            names: List[str] = []
-            for spec in specs:
-                existing = transformer_comm_metadata.get(spec.name)
-                if existing:
-                    if (
-                        existing["size"] != spec.size_bytes
-                        or existing["type"] != spec.kind
-                        or existing["participants"] != spec.participants
-                        or existing["interconnect_type"] != spec.interconnect
-                    ):
-                        raise ValueError(
-                            f"Conflicting CommSpec registration for '{spec.name}' "
-                            f"(existing={existing}, new={spec})"
-                        )
+            def _register_specs(specs: Sequence[CommSpec]) -> List[str]:
+                names: List[str] = []
+                for spec in specs:
+                    existing = transformer_comm_metadata.get(spec.name)
+                    placement = None
+                    if spec.extra:
+                        placement = spec.extra.get("placement")
+                    if existing:
+                        if (
+                            existing["size"] != spec.size_bytes
+                            or existing["type"] != spec.kind
+                            or existing["participants"] != spec.participants
+                            or existing["interconnect_type"] != spec.interconnect
+                        ):
+                            raise ValueError(
+                                f"Conflicting CommSpec registration for '{spec.name}' "
+                                f"(existing={existing}, new={spec})"
+                            )
+                    else:
+                        transformer_comm_metadata[spec.name] = {
+                            "size": spec.size_bytes,
+                            "type": spec.kind,
+                            "participants": spec.participants,
+                            "interconnect_type": spec.interconnect,
+                        }
+                        if placement:
+                            transformer_comm_metadata[spec.name]["placement"] = placement
+                    names.append(spec.name)
+                return names
+
+            def _make_ep_dense_sync_specs(
+                op_name: str,
+                direction: str,
+                total_bytes: int,
+            ) -> Tuple[CommSpec, ...]:
+                bytes_int = int(math.ceil(float(total_bytes or 0.0)))
+                if bytes_int <= 0 or self.ep <= 1:
+                    return ()
+                name = f"ep_dense_sync_{op_name}_{direction}"
+                return (
+                    CommSpec(
+                        name=name,
+                        kind=grad_collective,
+                        size_bytes=bytes_int,
+                        participants=int(self.ep),
+                        interconnect="ep",
+                        extra={
+                            "scope": "ep",
+                            "direction": direction,
+                            "op_name": op_name,
+                            "parallelism_mode": parallelism_mode.value,
+                            "placement": "post",
+                        },
+                    ),
+                )
+
+            def _build_direction_entry(
+                op_name: str,
+                direction: str,
+                timing: Optional[DirectionTiming],
+            ) -> Dict[str, Any]:
+                if timing is None:
+                    return {"duration": 0.0, "reduction": 0.0, "comm_keys": []}
+                specs = list(_make_comm_specs(op_name, direction, timing.comm_bytes, rules_by_mode))
+                if (
+                    include_transformer_backward
+                    and direction == "backward"
+                    and op_name == "layernorm1"
+                    and ep_dense_sync_bytes > 0
+                ):
+                    specs.extend(_make_ep_dense_sync_specs(op_name, direction, ep_dense_sync_bytes))
+                return {
+                    "duration": timing.compute_time,
+                    "reduction": timing.comm_time,
+                    "comm_keys": _register_specs(specs),
+                }
+
+            def _make_comm_specs(
+                op_name: str,
+                direction: str,
+                total_bytes: float,
+                rules: Dict[str, Dict[str, Optional[Dict[str, str]]]],
+            ) -> Tuple[CommSpec, ...]:
+                bytes_int = int(math.ceil(float(total_bytes or 0.0)))
+                if bytes_int <= 0:
+                    return ()
+                rule_spec = rules.get(op_name) or rules.get(COMM_RULE_DEFAULT_KEY)
+                if not rule_spec:
+                    raise ValueError(
+                        f"Missing communication rule for op '{op_name}' in mode '{parallelism_mode.value}' "
+                        f"with non-zero comm_bytes ({bytes_int})"
+                    )
+                rule = rule_spec.get(direction)
+                if not rule:
+                    return ()
+                kind = rule.get("kind")
+                scope = rule.get("participants")
+                if kind is None or not scope:
+                    return ()
+                if not isinstance(kind, CollectiveType):
+                    raise TypeError(
+                        f"Comm rule for '{op_name}' must use CollectiveType (got {type(kind).__name__})"
+                    )
+                kind_enum = kind
+                participants = participants_lookup.get(scope, 0)
+                if participants <= 1:
+                    return ()
+                interconnect = rule.get("interconnect", scope)
+                count_raw = rule.get("count", 1)
+                try:
+                    count = int(count_raw)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"Comm rule for '{op_name}' has non-integer count ({count_raw!r})"
+                    ) from exc
+                if count <= 0:
+                    return ()
+                if count == 1:
+                    sizes = [bytes_int]
                 else:
-                    transformer_comm_metadata[spec.name] = {
-                        "size": spec.size_bytes,
-                        "type": spec.kind,
-                        "participants": spec.participants,
-                        "interconnect_type": spec.interconnect,
-                    }
-                names.append(spec.name)
-            return names
+                    per_size = bytes_int // count
+                    if per_size * count != bytes_int:
+                        raise ValueError(
+                            f"Comm bytes for '{op_name}' ({bytes_int}) must be divisible by count={count}"
+                        )
+                    sizes = [per_size for _ in range(count)]
+                placement_spec = rule.get("placement", None)
+                placements: List[str] = []
+                if placement_spec is None:
+                    placements = ["post" for _ in range(len(sizes))]
+                elif isinstance(placement_spec, str):
+                    placements = [placement_spec for _ in range(len(sizes))]
+                else:
+                    try:
+                        placements = list(placement_spec)
+                    except TypeError as exc:
+                        raise ValueError(
+                            f"Comm rule for '{op_name}' has invalid placement ({placement_spec!r})"
+                        ) from exc
+                    if len(placements) != len(sizes):
+                        raise ValueError(
+                            f"Comm rule for '{op_name}' placement length mismatch "
+                            f"(expected {len(sizes)}, got {len(placements)})"
+                        )
+                specs: List[CommSpec] = []
+                for idx, size in enumerate(sizes):
+                    if size <= 0:
+                        continue
+                    placement = placements[idx] if idx < len(placements) else "post"
+                    if placement not in {"pre", "post"}:
+                        raise ValueError(
+                            f"Comm rule for '{op_name}' has invalid placement '{placement}' "
+                            "(expected 'pre' or 'post')"
+                        )
+                    name = f"{op_name}_{direction}_{kind_enum.value}"
+                    if len(sizes) > 1:
+                        name = f"{name}_part{idx}"
+                    specs.append(
+                        CommSpec(
+                            name=name,
+                            kind=kind_enum,
+                            size_bytes=size,
+                            participants=participants,
+                            interconnect=interconnect,
+                            extra={
+                                "scope": scope,
+                                "direction": direction,
+                                "op_name": op_name,
+                                "parallelism_mode": parallelism_mode.value,
+                                "placement": placement,
+                            },
+                        )
+                    )
+                return tuple(specs)
 
-        def _build_direction_entry(op_name: str, direction: str, timing: Optional[DirectionTiming]) -> Dict[str, Any]:
-            if timing is None:
-                return {"duration": 0.0, "reduction": 0.0, "comm_keys": []}
-            specs = _make_comm_specs(op_name, direction, timing.comm_bytes)
-            return {
-                "duration": timing.compute_time,
-                "reduction": timing.comm_time,
-                "comm_keys": _register_specs(specs),
+            def _build_group_operation(name: str, members: Tuple[str, ...]) -> OperationTiming:
+                ops = tuple(transformer_timings_local[m] for m in members)
+                group = OperationGroup(name, ops)
+                forward_memory = self._combine_mem(*(op.forward.memory_accesses for op in ops))
+                forward_flops = sum(op.forward.flops for op in ops)
+                forward_dir = DirectionTiming(
+                    compute_time=group.forward_compute_time(),
+                    comm_time=group.forward_comm_time(),
+                    comm_bytes=group.forward_comm_bytes(),
+                    flops=forward_flops,
+                    memory_accesses=forward_memory,
+                )
+                if include_transformer_backward:
+                    backward_memory = self._combine_mem(
+                        *(op.backward.memory_accesses for op in ops if op.backward is not None)
+                    )
+                    backward_flops = sum((op.backward.flops if op.backward else 0.0) for op in ops)
+                    backward_dir = DirectionTiming(
+                        compute_time=group.backward_compute_time(),
+                        comm_time=group.backward_comm_time(),
+                        comm_bytes=group.backward_comm_bytes(),
+                        flops=backward_flops,
+                        memory_accesses=backward_memory,
+                    )
+                else:
+                    backward_dir = None
+                return OperationTiming(name, forward_dir, backward_dir)
+
+            def _resolve_operation(name: str) -> OperationTiming:
+                if name in group_members:
+                    return _build_group_operation(name, group_members[name])
+                return transformer_timings_local[name]
+
+            if parallelism_mode not in (
+                ParallelismMode.CONTEXT,
+                ParallelismMode.TENSOR_CONTEXT_HYBRID,
+                ParallelismMode.TENSOR,
+                ParallelismMode.TENSOR_SEQUENCE,
+                ParallelismMode.SINGLE,
+            ):
+                raise ValueError(f"Unsupported parallelism mode: {parallelism_mode}")
+            op_names: Sequence[str] = ("layernorm1", "qkv_proj", "attention", "output_proj", "layernorm2", "MLP")
+            op_names = list(op_names)
+            if "optimizer" in transformer_timings_local:
+                op_names.append("optimizer")
+            if use_moe_layer and "MLP" in op_names:
+                mlp_index = op_names.index("MLP")
+                for offset, op_name in enumerate(("router", "moe_dispatch")):
+                    if op_name not in op_names:
+                        if op_name not in transformer_timings_local:
+                            raise KeyError(f"Missing transformer timing for operation '{op_name}'")
+                        op_names.insert(mlp_index + offset, op_name)
+                if "moe_combine" not in op_names:
+                    if "moe_combine" not in transformer_timings_local:
+                        raise KeyError("Missing transformer timing for operation 'moe_combine'")
+                    mlp_index = op_names.index("MLP")
+                    op_names.insert(mlp_index + 1, "moe_combine")
+
+            for key in op_names:
+                try:
+                    op_timing = _resolve_operation(key)
+                except KeyError as exc:
+                    raise KeyError(f"Missing transformer timing for operation '{key}'") from exc
+
+                entry = {
+                    "name": key,
+                    "forward": _build_direction_entry(key, "forward", op_timing.forward),
+                    "backward": _build_direction_entry(
+                        key, "backward", op_timing.backward if include_transformer_backward else None
+                    ),
+                }
+
+                if not include_transformer_backward:
+                    # Ensure backward section is zeroed when excluded.
+                    entry["backward"] = {"duration": 0.0, "reduction": 0.0, "comm_keys": []}
+
+                transformer_operation_entries.append(entry)
+            transformer_graph: Optional[Graph] = None
+            transformer_forward_root: Optional[Any] = None
+            transformer_backward_root: Optional[Any] = None
+
+            transformer_comp_times = {
+                "transformer": {
+                    "gemms": transformer_operation_entries,
+                }
             }
 
-        def _make_comm_specs(op_name: str, direction: str, total_bytes: float) -> Tuple[CommSpec, ...]:
-            bytes_int = int(math.ceil(float(total_bytes or 0.0)))
-            if bytes_int <= 0:
-                return ()
-            rule_spec = rules_by_mode.get(op_name) or rules_by_mode.get(COMM_RULE_DEFAULT_KEY)
-            if not rule_spec:
-                raise ValueError(
-                    f"Missing communication rule for op '{op_name}' in mode '{parallelism_mode.value}' "
-                    f"with non-zero comm_bytes ({bytes_int})"
-                )
-            rule = rule_spec.get(direction)
-            if not rule:
-                return ()
-            kind = rule.get("kind")
-            scope = rule.get("participants")
-            if kind is None or not scope:
-                return ()
-            if not isinstance(kind, CollectiveType):
-                raise TypeError(
-                    f"Comm rule for '{op_name}' must use CollectiveType (got {type(kind).__name__})"
-                )
-            kind_enum = kind
-            participants = participants_lookup.get(scope, 0)
-            if participants <= 1:
-                return ()
-            interconnect = rule.get("interconnect", scope)
-            name = f"{op_name}_{direction}_{kind_enum.value}"
-            return (
-                CommSpec(
-                    name=name,
-                    kind=kind_enum,
-                    size_bytes=bytes_int,
-                    participants=participants,
-                    interconnect=interconnect,
-                    extra={
-                        "scope": scope,
-                        "direction": direction,
-                        "op_name": op_name,
-                        "parallelism_mode": parallelism_mode.value,
-                    },
-                ),
+            transformer_graph = llm_simulation.Graph(
+                mode="transformer",
+                dp=self.dp,
+                pp=self.pp,
+                tp=self.tp,
+                cp=self.cp,
+                ep=graph_ep,
+                comp_times=transformer_comp_times,
+                comm_metadata=transformer_comm_metadata,
+                misc_metadata={"dp_zero_stage": self.zero_stage},
             )
-
-        def _build_group_operation(name: str, members: Tuple[str, ...]) -> OperationTiming:
-            ops = tuple(transformer_timings[m] for m in members)
-            group = OperationGroup(name, ops)
-            forward_memory = self._combine_mem(*(op.forward.memory_accesses for op in ops))
-            forward_flops = sum(op.forward.flops for op in ops)
-            forward_dir = DirectionTiming(
-                compute_time=group.forward_compute_time(),
-                comm_time=group.forward_comm_time(),
-                comm_bytes=group.forward_comm_bytes(),
-                flops=forward_flops,
-                memory_accesses=forward_memory,
-            )
+            transformer_forward_root = transformer_graph.construct_transformer_graph(direction="forward")
             if include_transformer_backward:
-                backward_memory = self._combine_mem(
-                    *(op.backward.memory_accesses for op in ops if op.backward is not None)
-                )
-                backward_flops = sum((op.backward.flops if op.backward else 0.0) for op in ops)
-                backward_dir = DirectionTiming(
-                    compute_time=group.backward_compute_time(),
-                    comm_time=group.backward_comm_time(),
-                    comm_bytes=group.backward_comm_bytes(),
-                    flops=backward_flops,
-                    memory_accesses=backward_memory,
-                )
-            else:
-                backward_dir = None
-            return OperationTiming(name, forward_dir, backward_dir)
+                bwd_direction = "backward"
+                transformer_backward_root = transformer_graph.construct_transformer_graph(direction=bwd_direction)
 
-        def _resolve_operation(name: str) -> OperationTiming:
-            if name in group_members:
-                return _build_group_operation(name, group_members[name])
-            return transformer_timings[name]
-
-        if parallelism_mode not in (
-            ParallelismMode.CONTEXT,
-            ParallelismMode.TENSOR_CONTEXT_HYBRID,
-            ParallelismMode.TENSOR,
-            ParallelismMode.TENSOR_SEQUENCE,
-            ParallelismMode.SINGLE,
-        ):
-            raise ValueError(f"Unsupported parallelism mode: {parallelism_mode}")
-        op_names: Sequence[str] = ("layernorm1", "qkv_proj", "attention", "output_proj", "layernorm2", "MLP")
-        op_names = list(op_names)
-        if "optimizer" in transformer_timings:
-            op_names.append("optimizer")
-        if self.use_moe and "MLP" in op_names and "router" not in op_names: # if MOE is enabled, ensure router is included in the graph
-            mlp_index = op_names.index("MLP")
-            op_names.insert(mlp_index, "router")
-
-        for key in op_names:
-            try:
-                op_timing = _resolve_operation(key)
-            except KeyError as exc:
-                raise KeyError(f"Missing transformer timing for operation '{key}'") from exc
-
-            entry = {
-                "name": key,
-                "forward": _build_direction_entry(key, "forward", op_timing.forward),
-                "backward": _build_direction_entry(key, "backward", op_timing.backward if include_transformer_backward else None),
-            }
-
-            if not include_transformer_backward:
-                # Ensure backward section is zeroed when excluded.
-                entry["backward"] = {"duration": 0.0, "reduction": 0.0, "comm_keys": []}
-
-            transformer_operation_entries.append(entry)
-        transformer_graph: Optional[Graph] = None
-        transformer_forward_root: Optional[Any] = None
-        transformer_backward_root: Optional[Any] = None
-
-        transformer_comp_times = {
-            "transformer": {
-                "gemms": transformer_operation_entries,
-            }
-        }
-
-        transformer_graph = llm_simulation.Graph(
-            mode="transformer",
-            dp=self.dp,
-            lp=self.lp,
-            tp=self.tp,
-            cp=self.cp,
-            comp_times=transformer_comp_times,
-            comm_metadata=transformer_comm_metadata,
-            misc_metadata={"dp_zero_stage": self.zero_stage},
-        )
-        transformer_forward_root = transformer_graph.construct_transformer_graph(direction="forward")
-        if include_transformer_backward:
-            bwd_direction = "backward"
-            transformer_backward_root = transformer_graph.construct_transformer_graph(direction=bwd_direction)
-
-        transformer_forward_root = apply_overlap_transforms(
-            transformer_forward_root,
-            parallelism_mode,
-            self.tp_overlap,
-            self.tp_sp_overlap,
-            self.cp_overlap,
-        )
-        if include_transformer_backward:
-            transformer_backward_root = apply_overlap_transforms(
-                transformer_backward_root,
+            transformer_forward_root = apply_overlap_transforms(
+                transformer_forward_root,
                 parallelism_mode,
                 self.tp_overlap,
                 self.tp_sp_overlap,
                 self.cp_overlap,
+            )
+            if include_transformer_backward:
+                transformer_backward_root = apply_overlap_transforms(
+                    transformer_backward_root,
+                    parallelism_mode,
+                    self.tp_overlap,
+                    self.tp_sp_overlap,
+                    self.cp_overlap,
+                )
+            return transformer_graph, transformer_forward_root, transformer_backward_root
+
+        transformer_graph, transformer_forward_root, transformer_backward_root = _build_transformer_graph(
+            transformer_timings,
+            use_moe_layer=False,
+            ep_dense_sync_bytes=ep_dense_sync_bytes_dense,
+        )
+        moe_transformer_graph: Optional[Graph] = None
+        moe_transformer_forward_root: Optional[Any] = None
+        moe_transformer_backward_root: Optional[Any] = None
+        moe_layer_mask = list(getattr(self, "moe_layer_mask", []) or [])
+        has_moe_layers = bool(self.use_moe and any(moe_layer_mask))
+        if has_moe_layers:
+            if not moe_transformer_timings or not moe_node_breakdown:
+                raise ValueError("MoE layer schedule requires moe_transformer_timings and moe_node_breakdown.")
+            (
+                moe_transformer_graph,
+                moe_transformer_forward_root,
+                moe_transformer_backward_root,
+            ) = _build_transformer_graph(
+                moe_transformer_timings,
+                use_moe_layer=True,
+                ep_dense_sync_bytes=ep_dense_sync_bytes_moe,
+            )
+
+        transformer_graph_no_dp = None
+        transformer_forward_root_no_dp = None
+        transformer_backward_root_no_dp = None
+        moe_transformer_graph_no_dp = None
+        moe_transformer_forward_root_no_dp = None
+        moe_transformer_backward_root_no_dp = None
+        if need_no_dp_variant and include_transformer_backward and self.use_moe and self.ep > 1:
+            (
+                transformer_graph_no_dp,
+                transformer_forward_root_no_dp,
+                transformer_backward_root_no_dp,
+            ) = _build_transformer_graph(
+                transformer_timings,
+                use_moe_layer=False,
+                ep_dense_sync_bytes=0,
+            )
+            if has_moe_layers:
+                if not moe_transformer_timings or not moe_node_breakdown:
+                    raise ValueError("MoE layer schedule requires moe_transformer_timings and moe_node_breakdown.")
+                (
+                    moe_transformer_graph_no_dp,
+                    moe_transformer_forward_root_no_dp,
+                    moe_transformer_backward_root_no_dp,
+                ) = _build_transformer_graph(
+                    moe_transformer_timings,
+                    use_moe_layer=True,
+                    ep_dense_sync_bytes=0,
+                )
+
+        dense_transformer_f = node_breakdown.get('transformer_time_f', 0.0)
+        dense_transformer_b = node_breakdown.get('transformer_time_b', 0.0) if include_pipeline_backward else 0.0
+        moe_transformer_f = dense_transformer_f
+        moe_transformer_b = dense_transformer_b
+        if has_moe_layers and moe_node_breakdown:
+            moe_transformer_f = moe_node_breakdown.get('transformer_time_f', dense_transformer_f)
+            moe_transformer_b = (
+                moe_node_breakdown.get('transformer_time_b', dense_transformer_b)
+                if include_pipeline_backward
+                else 0.0
             )
 
         comp_times = {
@@ -2744,12 +3570,42 @@ class TimeCalculationLLM(TimeCalculation):
             "embedding_b": node_breakdown.get('embedding_b', 0.0) if include_pipeline_backward else 0.0,
             "linear_softmax_f": node_breakdown.get('linear_softmax_f', 0.0),
             "linear_softmax_b": node_breakdown.get('linear_softmax_b', 0.0) if include_pipeline_backward else 0.0,
-            "transformer_f": node_breakdown.get('transformer_time_f', 0.0),
-            "transformer_b": node_breakdown.get('transformer_time_b', 0.0) if include_pipeline_backward else 0.0,
+            "transformer_f": dense_transformer_f,
+            "transformer_b": dense_transformer_b,
+            "transformer_f_dense": dense_transformer_f,
+            "transformer_b_dense": dense_transformer_b,
+            "transformer_f_moe": moe_transformer_f,
+            "transformer_b_moe": moe_transformer_b,
             "optimizer": self.get_data_parallel_reduction_llm(hidden_dim, intermediate_size),
             "cross_layer_f": 0.0,
             "cross_layer_b": 0.0,
         }
+        comp_times_no_dp = None
+        if need_no_dp_variant:
+            comp_times_no_dp = dict(comp_times)
+            if include_pipeline_backward and self.use_moe and self.ep > 1:
+                gemm_shapes_local = gemm_shapes
+                if gemm_shapes_local is None:
+                    gemm_shapes_local = llm_util.process_gemm_shapes(
+                        self,
+                        batch_size=batch_size,
+                        seq_len=seq_len,
+                        d_model=hidden_dim,
+                        num_heads=self.num_heads,
+                        kv_heads=self.kv_heads,
+                        intermediate_size=intermediate_size,
+                        vocab_size=vocab_size,
+                    )
+                gemm_linear = gemm_shapes_local.get("linear") if gemm_shapes_local else None
+                if gemm_linear is not None:
+                    comp_times_no_dp["linear_softmax_b"] = self.get_linear_softmax_b(
+                        gemm_linear,
+                    )
+                comp_times_no_dp["embedding_b"] = self.get_embedding_b(
+                    vocab_size=vocab_size,
+                    seq_len=seq_len,
+                    hidden_dim=hidden_dim,
+                )
         flattened_mode = self.execution_mode == ExecutionMode.FULL_ASTRASIM_FLATTENED
         pipeline_style_recompute_flag = bool(getattr(self, "full_recomputation", False))
         misc_metadata = {
@@ -2760,14 +3616,16 @@ class TimeCalculationLLM(TimeCalculation):
             "flattened_mode": flattened_mode,
             "pipeline_style_recompute": pipeline_style_recompute_flag,
             "dp_microbatch_mode": getattr(self, "dp_microbatch", "every_mb"),
+            "moe_layer_mask": moe_layer_mask,
         }
 
         pipeline_graph_obj = llm_simulation.Graph(
             mode="pipeline",
             dp=self.dp,
-            lp=self.lp,
+            pp=self.pp,
             tp=self.tp,
             cp=self.cp,
+            ep=graph_ep,
             comp_times=comp_times,
             comm_metadata=comm_metadata,
             misc_metadata=misc_metadata,
@@ -2779,15 +3637,15 @@ class TimeCalculationLLM(TimeCalculation):
         )
         pipeline_graph_obj_no_dp = None
         graph_root_no_dp = None
-        need_no_dp_variant = getattr(self, "gradient_accumulation_steps", 1) > 1
         if need_no_dp_variant:
             pipeline_graph_obj_no_dp = llm_simulation.Graph( # if gradient accumulation is used, we need a no-dp variant of the graph for the non-last step, since dp all-reduce is only done on the last step
                 mode="pipeline",
                 dp=1,
-                lp=self.lp,
+                pp=self.pp,
                 tp=self.tp,
                 cp=self.cp,
-                comp_times=comp_times,
+                ep=graph_ep,
+                comp_times=comp_times_no_dp or comp_times,
                 comm_metadata=comm_metadata,
                 misc_metadata=misc_metadata,
             )
@@ -2800,6 +3658,13 @@ class TimeCalculationLLM(TimeCalculation):
         
         interconnect_params = self._build_interconnect_params()
 
+        self.transformer_graph_no_dp = transformer_graph_no_dp
+        self.transformer_forward_root_no_dp = transformer_forward_root_no_dp
+        self.transformer_backward_root_no_dp = transformer_backward_root_no_dp
+        self.transformer_graph_moe_no_dp = moe_transformer_graph_no_dp
+        self.transformer_forward_root_moe_no_dp = moe_transformer_forward_root_no_dp
+        self.transformer_backward_root_moe_no_dp = moe_transformer_backward_root_no_dp
+
         return (
             pipeline_graph_obj,
             graph_root,
@@ -2808,6 +3673,9 @@ class TimeCalculationLLM(TimeCalculation):
             transformer_graph,
             transformer_forward_root,
             transformer_backward_root,
+            moe_transformer_graph,
+            moe_transformer_forward_root,
+            moe_transformer_backward_root,
             interconnect_params,
         )
 
@@ -2874,7 +3742,22 @@ class TimeCalculationLLM(TimeCalculation):
             kv_heads,
             intermediate_size,
             num_SMs,
+            use_moe_override=False,
         )
+        moe_transformer_timings = None
+        moe_node_breakdown = None
+        if self.use_moe:
+            moe_transformer_timings, moe_node_breakdown = self.compute_all_gemm_and_node_times(
+                batch_size,
+                vocab_size,
+                hidden_dim,
+                seq_len,
+                num_heads,
+                kv_heads,
+                self.moe_intermediate_size,
+                num_SMs,
+                use_moe_override=True,
+            )
 
         mem_estimator = MemoryEstimator(self)
         memory_data = mem_estimator.build_memory_data(
@@ -2891,9 +3774,34 @@ class TimeCalculationLLM(TimeCalculation):
         optimizer_mem_layer = memory_data.get("optimizer_mem_per_layer", 0.0)
         weight_memory_layer = memory_data.get("weight_mem_per_layer", 0.0)
         transformer_mem_layer = memory_data.get("total_mem_per_layer", 0.0)
+        if self.use_moe:
+            dense_layers = max(0, self.num_layers - self.num_moe_layers)
+            moe_layers = max(0, self.num_moe_layers)
+            total_layers = max(1, dense_layers + moe_layers)
+            act_dense = memory_data.get("activation_mem_per_layer_dense", transformer_act_layer)
+            act_moe = memory_data.get("activation_mem_per_layer_moe", act_dense)
+            act_inf_dense = memory_data.get("activation_mem_per_layer_inference_dense", transformer_act_layer_inf)
+            act_inf_moe = memory_data.get("activation_mem_per_layer_inference_moe", act_inf_dense)
+            static_dense = memory_data.get("static_mem_per_layer_dense", transformer_static_layer)
+            static_moe = memory_data.get("static_mem_per_layer_moe", static_dense)
+            grad_dense = memory_data.get("gradient_mem_per_layer_dense", gradient_mem_layer)
+            grad_moe = memory_data.get("gradient_mem_per_layer_moe", grad_dense)
+            opt_dense = memory_data.get("optimizer_mem_per_layer_dense", optimizer_mem_layer)
+            opt_moe = memory_data.get("optimizer_mem_per_layer_moe", opt_dense)
+            weight_dense = memory_data.get("weight_mem_per_layer_dense", weight_memory_layer)
+            weight_moe = memory_data.get("weight_mem_per_layer_moe", weight_dense)
+            total_dense = memory_data.get("total_mem_per_layer_dense", transformer_mem_layer)
+            total_moe = memory_data.get("total_mem_per_layer_moe", total_dense)
+            transformer_act_layer = (act_dense * dense_layers + act_moe * moe_layers) / total_layers
+            transformer_act_layer_inf = (act_inf_dense * dense_layers + act_inf_moe * moe_layers) / total_layers
+            transformer_static_layer = (static_dense * dense_layers + static_moe * moe_layers) / total_layers
+            gradient_mem_layer = (grad_dense * dense_layers + grad_moe * moe_layers) / total_layers
+            optimizer_mem_layer = (opt_dense * dense_layers + opt_moe * moe_layers) / total_layers
+            weight_memory_layer = (weight_dense * dense_layers + weight_moe * moe_layers) / total_layers
+            transformer_mem_layer = (total_dense * dense_layers + total_moe * moe_layers) / total_layers
 
         if self._debug_memory:
-            layers_per_device = max(1, math.ceil(self.num_layers / max(1, self.lp)))
+            layers_per_device = max(1, math.ceil(self.num_layers / max(1, self.pp)))
             to_gib = lambda bytes_val: float(bytes_val) / float(1024 ** 3)
             self._memory_breakdown_debug = {
                 "layers_per_device": layers_per_device,
@@ -2923,10 +3831,15 @@ class TimeCalculationLLM(TimeCalculation):
             transformer_graph,
             transformer_forward_root,
             transformer_backward_root,
+            moe_transformer_graph,
+            moe_transformer_forward_root,
+            moe_transformer_backward_root,
             interconnect_params,
         ) = self._prepare_execution_graphs(
             node_breakdown=node_breakdown,
             transformer_timings=transformer_timings,
+            moe_node_breakdown=moe_node_breakdown,
+            moe_transformer_timings=moe_transformer_timings,
             batch_size=batch_size,
             seq_len=seq_len,
             hidden_dim=hidden_dim,
@@ -2946,10 +3859,23 @@ class TimeCalculationLLM(TimeCalculation):
         self.transformer_graph = transformer_graph
         self.transformer_forward_root = transformer_forward_root
         self.transformer_backward_root = transformer_backward_root
+        self.transformer_graph_moe = moe_transformer_graph
+        self.transformer_forward_root_moe = moe_transformer_forward_root
+        self.transformer_backward_root_moe = moe_transformer_backward_root
         self.transformer_analytical_time_forward = node_breakdown['transformer_time_f']
         # Report backward including recompute overhead when enabled.
         self.transformer_analytical_time_backward_combined = node_breakdown['transformer_time_b_combined']
         self.transformer_analytical_time_backward = self.transformer_analytical_time_backward_combined
+        if self.use_moe and moe_node_breakdown and self.num_moe_layers == self.num_layers:
+            self.transformer_analytical_time_forward = moe_node_breakdown.get(
+                "transformer_time_f",
+                self.transformer_analytical_time_forward,
+            )
+            self.transformer_analytical_time_backward_combined = moe_node_breakdown.get(
+                "transformer_time_b_combined",
+                self.transformer_analytical_time_backward_combined,
+            )
+            self.transformer_analytical_time_backward = self.transformer_analytical_time_backward_combined
 
         self.pipeline_graph = pipeline_graph_obj
         self.pipeline_root = graph_root
@@ -2968,14 +3894,27 @@ class TimeCalculationLLM(TimeCalculation):
         if self.gradient_accumulation_steps > 1:
             if not (self.pipeline_graph_no_dp and self.pipeline_root_no_dp):
                 raise RuntimeError("Gradient accumulation steps > 1 requires a no-DP pipeline graph")
+            transformer_graph_no_dp = self.transformer_graph_no_dp or self.transformer_graph
+            transformer_forward_root_no_dp = self.transformer_forward_root_no_dp or self.transformer_forward_root
+            transformer_backward_root_no_dp = self.transformer_backward_root_no_dp or self.transformer_backward_root
+            moe_transformer_graph_no_dp = self.transformer_graph_moe_no_dp or self.transformer_graph_moe
+            moe_transformer_forward_root_no_dp = (
+                self.transformer_forward_root_moe_no_dp or self.transformer_forward_root_moe
+            )
+            moe_transformer_backward_root_no_dp = (
+                self.transformer_backward_root_moe_no_dp or self.transformer_backward_root_moe
+            )
             dispatcher_no_dp = LLMExecutionDispatcher(
                 time_calc=self,
                 pipeline_graph=self.pipeline_graph_no_dp,
                 pipeline_root=self.pipeline_root_no_dp,
                 interconnect_params=self.pipeline_interconnect,
-                transformer_graph=self.transformer_graph,
-                transformer_forward_root=self.transformer_forward_root,
-                transformer_backward_root=self.transformer_backward_root,
+                transformer_graph=transformer_graph_no_dp,
+                transformer_forward_root=transformer_forward_root_no_dp,
+                transformer_backward_root=transformer_backward_root_no_dp,
+                moe_transformer_graph=moe_transformer_graph_no_dp,
+                moe_transformer_forward_root=moe_transformer_forward_root_no_dp,
+                moe_transformer_backward_root=moe_transformer_backward_root_no_dp,
                 no_data_parallel=True,
             )
             try:
@@ -2992,6 +3931,9 @@ class TimeCalculationLLM(TimeCalculation):
             transformer_graph=self.transformer_graph,
             transformer_forward_root=self.transformer_forward_root,
             transformer_backward_root=self.transformer_backward_root,
+            moe_transformer_graph=self.transformer_graph_moe,
+            moe_transformer_forward_root=self.transformer_forward_root_moe,
+            moe_transformer_backward_root=self.transformer_backward_root_moe,
             no_data_parallel=False,
         )
         try:
@@ -3037,6 +3979,9 @@ class TimeCalculationLLM(TimeCalculation):
             transformer_graph=self.transformer_graph,
             transformer_forward_root=self.transformer_forward_root,
             transformer_backward_root=self.transformer_backward_root,
+            moe_transformer_graph=self.transformer_graph_moe,
+            moe_transformer_forward_root=self.transformer_forward_root_moe,
+            moe_transformer_backward_root=self.transformer_backward_root_moe,
             no_data_parallel=False,
         )
         memory_root = dispatcher.build_flattened_root_for_memory()

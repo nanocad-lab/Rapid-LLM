@@ -3,7 +3,7 @@ model_param:
   run_type: "training" # Type of run: "training" or "inference"
   tied_embeddings: true  # Share input and output embedding weights (WIP: affects memory estimation only)
   model_type: "llama"  # gpt assumes dense-style architecture with GELU; llama assumes llama-style architecture with SwiGLU
-  global_batch_size: 32  # Sequences per global batch
+  global_batch_size: 24  # Sequences per global batch
   gradient_accumulation_steps: 1  # Number of gradient accumulation micro-steps per optimizer update
   seq_len: 32768  # Total context length (tokens per sequence)
   decode_len: 1024 # Number of tokens to decode during inference
@@ -14,8 +14,13 @@ model_param:
     kv_heads: 8  # Number of key/value heads (used only when attention_type = "gqa")
     use_flashattention: true  # Enable FlashAttention optimization
     attention_tile_size: 128  # Tile size used in attention computation
-  num_experts: 1   # Number of experts in MoE layers. Set to 1 to disable MoE.
-  top_k: 1   # Number of active experts per token in MoE
+  moe:
+    num_experts: 1
+    top_k: 1
+    moe_intermediate_size: 28672
+    n_shared_experts: 0
+    moe_layer_freq: 1
+    first_k_dense_replace: 80
   intermediate_size: 28672 # Output dimension of the first FFN layer (typically 4×hidden_dim)
   vocab_size: 128256  # Vocabulary size
   num_layers: 80 # Number of transformer layers

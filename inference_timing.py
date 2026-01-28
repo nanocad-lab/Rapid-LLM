@@ -1,7 +1,23 @@
+# Copyright 2026 NanoCad lab, UCLA
+# https://nanocad.ee.ucla.edu/
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """LLM inference prefill time-calculation entry points."""
 
 import math
 import os
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Mapping, Set
 from train_timing import (
     LLMExecutionDispatcher,
@@ -41,11 +57,14 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
         *,
         batch_size: int,
         total_seq_len: int,
+        use_moe_layer: bool,
         gemm_shapes: Optional[Dict[str, Tuple[int, ...]]] = None,
     ) -> Tuple[Dict[str, OperationTiming], Dict[str, float]]:
         """Construct transformer timings + node breakdown for a single decode step."""
 
-        head_dim = self.hidden_dim // self.num_heads
+        head_dim = getattr(self, "head_dim", None)
+        if head_dim is None:
+            head_dim = self.hidden_dim // self.num_heads
 
         token_bytes = llm_util.kv_cache_token_bytes(
             batch_size=batch_size,
@@ -53,21 +72,29 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
             head_dim=head_dim,
             precision_bytes=self.precision.kv_cache,
         )
-        seq_degree = self._sequence_parallel_degree()
-        comm_kind = CollectiveType.ALL_REDUCE if seq_degree == 1 else CollectiveType.REDUCE_SCATTER
-
-        intermediate_size = self.intermediate_size
-        gemm_shapes = gemm_shapes or llm_util.process_decode_gemm_shapes(
-            self,
-            batch_size=batch_size,
-            current_seq_len=total_seq_len,
-            d_model=self.hidden_dim,
-            num_heads=self.num_heads,
-            kv_heads=self.kv_heads,
-            intermediate_size=intermediate_size,
-            vocab_size=self.vocab_size,
-            model_type=self.model_type,
-        )
+        intermediate_size = self.moe_intermediate_size if use_moe_layer else self.intermediate_size
+        gemm_ctx = self
+        if use_moe_layer != self.use_moe:
+            gemm_ctx = SimpleNamespace(
+                use_moe=use_moe_layer,
+                moe_num_experts=self.moe_num_experts,
+                moe_top_k=self.moe_top_k,
+                moe_intermediate_size=intermediate_size,
+                model_type=self.model_type,
+                head_dim=getattr(self, "head_dim", None),
+            )
+        if gemm_shapes is None or use_moe_layer != self.use_moe:
+            gemm_shapes = llm_util.process_decode_gemm_shapes(
+                gemm_ctx,
+                batch_size=batch_size,
+                current_seq_len=total_seq_len,
+                d_model=self.hidden_dim,
+                num_heads=self.num_heads,
+                kv_heads=self.kv_heads,
+                intermediate_size=intermediate_size,
+                vocab_size=self.vocab_size,
+                model_type=self.model_type,
+            )
 
         gemm_qkv_proj = gemm_shapes["qkv_proj"]
         gemm_attention_score = gemm_shapes["attention_score"]
@@ -159,13 +186,8 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
         transformer_timings["attention_scale_softmax"] = attention_scale_softmax_op
 
         # Output projection
-        out_proj_time, _, out_proj_size, out_proj_flops, out_proj_mem = self.parallelism_gemm_forward(
+        out_proj_time, out_proj_reduction, out_proj_size, out_proj_flops, out_proj_mem = self.parallelism_gemm_forward(
             gemm_output_proj, "decode_output_projection_f", gemm_type=GemmType.OUT_PROJ
-        )
-        out_proj_reduction = (
-            self.get_tensor_reduction_time(out_proj_size, comm_kind, "decode_output_projection")
-            if out_proj_size
-            else 0.0
         )
         transformer_timings["output_proj"] = OperationTiming(
             "output_proj",
@@ -180,16 +202,118 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
             backward=None,
         )
 
-        # FFN layers
-        ffn1_time, ffn1_reduction, ffn1_size, ffn1_flops, ffn1_mem = self.parallelism_gemm_forward(
-            gemm_ffn1, "decode_ffn1_f", gemm_type=GemmType.FFN1
-        )
-        ffn2_time, _, ffn2_size, ffn2_flops, ffn2_mem = self.parallelism_gemm_forward(
-            gemm_ffn2, "decode_ffn2_f", gemm_type=GemmType.FFN2
-        )
-        ffn2_reduction = (
-            self.get_tensor_reduction_time(ffn2_size, comm_kind, "decode_ffn2") if ffn2_size else 0.0
-        )
+        # FFN layers (dense vs MoE)
+        router_time_f = 0.0
+        router_comm_f = 0.0
+        router_bytes_f = 0.0
+        dispatch_fwd_time = 0.0
+        dispatch_fwd_bytes = 0.0
+        combine_fwd_time = 0.0
+        moe_tokens_local = None
+        moe_tokens_shared = None
+        if not use_moe_layer:
+            ffn1_time, ffn1_reduction, ffn1_size, ffn1_flops, ffn1_mem = self.parallelism_gemm_forward(
+                gemm_ffn1, "decode_ffn1_f", gemm_type=GemmType.FFN1
+            )
+            ffn2_time, ffn2_reduction, ffn2_size, ffn2_flops, ffn2_mem = self.parallelism_gemm_forward(
+                gemm_ffn2, "decode_ffn2_f", gemm_type=GemmType.FFN2
+            )
+        else:
+            gemm_router = gemm_shapes.get("router")
+            if gemm_router is None:
+                raise KeyError("Missing decode GEMM shape for 'router'")
+            allow_padding = self._moe_allow_padding()
+            (
+                tokens_owner,
+                tokens_dispatched,
+                tokens_local,
+                _experts_per_rank,
+                _tokens_per_expert,
+            ) = self._moe_routed_tokens_per_expert(
+                batch_size,
+                output_seq_len,
+                allow_padding=allow_padding,
+            )
+            moe_tokens_local = tokens_local
+            moe_tokens_shared = self._moe_tokens_shared(tokens_owner)
+            router_time_f, router_comm_f, router_bytes_f = self.get_router_f(
+                gemm_router,
+                gemm_ffn1,
+                batch_size=batch_size,
+                seq_len=output_seq_len,
+            )
+            moe_group = self._moe_routing_group()
+            axis = None
+            dispatch_fwd_bytes = int(
+                math.ceil(self.precision.activations * tokens_dispatched * self.hidden_dim)
+            )
+            dispatch_fwd_time = self.network_model.collective(
+                kind=CollectiveType.ALL_TO_ALL,
+                size_bytes=dispatch_fwd_bytes,
+                participants=moe_group,
+                ib=self.links["ep"].bandwidth,
+                ll=self.links["ep"].latency,
+                local_bytes=0.0,
+                debug_label="decode_moe_dispatch_f_all_to_all",
+                axis=axis,
+            )
+            ffn1_time, ffn1_reduction, ffn1_size, ffn1_flops, ffn1_mem = self.get_moe_ffn_f(
+                gemm_ffn1,
+                "decode_ffn1_f",
+                gemm_type=GemmType.FFN1,
+                batch_size=batch_size,
+                seq_len=output_seq_len,
+                allow_padding=allow_padding,
+            )
+            ffn2_time, ffn2_reduction, ffn2_size, ffn2_flops, ffn2_mem = self.get_moe_ffn_f(
+                gemm_ffn2,
+                "decode_ffn2_f",
+                gemm_type=GemmType.FFN2,
+                batch_size=batch_size,
+                seq_len=output_seq_len,
+                allow_padding=allow_padding,
+            )
+            combine_fwd_time = self.network_model.collective(
+                kind=CollectiveType.ALL_TO_ALL,
+                size_bytes=dispatch_fwd_bytes,
+                participants=moe_group,
+                ib=self.links["ep"].bandwidth,
+                ll=self.links["ep"].latency,
+                local_bytes=0.0,
+                debug_label="decode_moe_combine_f_all_to_all",
+                axis=axis,
+            )
+            transformer_timings["router"] = OperationTiming(
+                "router",
+                forward=_make_forward(
+                    "router",
+                    compute_time=router_time_f,
+                    comm_time=router_comm_f,
+                    comm_bytes=router_bytes_f,
+                ),
+                backward=None,
+            )
+            transformer_timings["moe_dispatch"] = OperationTiming(
+                "moe_dispatch",
+                forward=_make_forward(
+                    "moe_dispatch",
+                    compute_time=0.0,
+                    comm_time=dispatch_fwd_time,
+                    comm_bytes=dispatch_fwd_bytes,
+                ),
+                backward=None,
+            )
+            transformer_timings["moe_combine"] = OperationTiming(
+                "moe_combine",
+                forward=_make_forward(
+                    "moe_combine",
+                    compute_time=0.0,
+                    comm_time=combine_fwd_time,
+                    comm_bytes=dispatch_fwd_bytes,
+                ),
+                backward=None,
+            )
+
         transformer_timings["ffn1"] = OperationTiming(
             "ffn1",
             forward=_make_forward(
@@ -216,10 +340,23 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
         )
 
         # GELU/SwiGLU activation
-        if self.model_type == "llama":
-            act_f = self.get_swiglu_f(gemm_ffn1)
+        ffn1_spec = self._shard_gemm_descriptor(gemm_ffn1, GemmType.FFN1)
+        ffn1_activation_shape = (ffn1_spec.shard_m, ffn1_spec.k, ffn1_spec.shard_n)
+        ffn1_activation_shape_shared = None
+        if use_moe_layer and moe_tokens_local is not None:
+            use_tp_sharded = bool(getattr(self, "tp_ep", True))
+            ffn1_n = ffn1_spec.shard_n if use_tp_sharded else ffn1_spec.n
+            ffn1_activation_shape = (moe_tokens_local, ffn1_spec.k, ffn1_n)
+            if moe_tokens_shared and moe_tokens_shared > 0:
+                ffn1_activation_shape_shared = (moe_tokens_shared, ffn1_spec.k, ffn1_n)
+        if llm_util.is_llama_style(self.model_type):
+            act_f = self.get_swiglu_f(ffn1_activation_shape)
+            if ffn1_activation_shape_shared is not None:
+                act_f += self.get_swiglu_f(ffn1_activation_shape_shared)
         else:
-            act_f = self.get_gelu_f(gemm_ffn1)
+            act_f = self.get_gelu_f(ffn1_activation_shape)
+            if ffn1_activation_shape_shared is not None:
+                act_f += self.get_gelu_f(ffn1_activation_shape_shared)
         transformer_timings["gelu"] = OperationTiming(
             "gelu",
             forward=_make_forward("gelu", compute_time=act_f, comm_time=0.0, comm_bytes=0.0),
@@ -227,10 +364,14 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
         )
 
         # Layer norms
+        head_dim = getattr(self, "head_dim", None)
+        if head_dim is None:
+            head_dim = self.hidden_dim // self.num_heads
+        q_size = self.num_heads * head_dim
         output_proj_shape = (
             batch_size,
             output_seq_len,
-            self.hidden_dim,
+            q_size,
             self.hidden_dim,
         )
         residual1_f = self.get_residual_f(output_proj_shape)
@@ -306,6 +447,8 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
         ffn1_forward = ffn1_time + ffn1_reduction
         ffn2_forward = ffn2_time + ffn2_reduction
         mlp_forward = ffn1_forward + act_f + ffn2_forward
+        if use_moe_layer:
+            mlp_forward += router_time_f + dispatch_fwd_time + combine_fwd_time
 
         layernorm1_forward = residual1_f + layernorm1_f
         layernorm2_forward = residual2_f + layernorm2_f
@@ -338,14 +481,60 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
         total_seq_len: int,
         gemm_shapes: Optional[Dict[str, Tuple[int, ...]]] = None,
     ):
-        intermediate_size = self.intermediate_size
+        moe_layers_active = bool(self.use_moe and any(getattr(self, "moe_layer_mask", []) or []))
+        moe_intermediate = self.moe_intermediate_size
+        decode_gemm_shapes_moe = gemm_shapes
+        if decode_gemm_shapes_moe is None:
+            decode_gemm_shapes_moe = llm_util.process_decode_gemm_shapes(
+                self,
+                batch_size=batch_size,
+                current_seq_len=total_seq_len,
+                d_model=self.hidden_dim,
+                num_heads=self.num_heads,
+                kv_heads=self.kv_heads,
+                intermediate_size=moe_intermediate if self.use_moe else self.intermediate_size,
+                vocab_size=self.vocab_size,
+                model_type=self.model_type,
+            )
+        decode_gemm_shapes_dense = decode_gemm_shapes_moe
+        if self.use_moe:
+            dense_ctx = SimpleNamespace(
+                use_moe=False,
+                moe_num_experts=self.moe_num_experts,
+                moe_top_k=self.moe_top_k,
+                moe_intermediate_size=self.intermediate_size,
+                model_type=self.model_type,
+                head_dim=getattr(self, "head_dim", None),
+            )
+            decode_gemm_shapes_dense = llm_util.process_decode_gemm_shapes(
+                dense_ctx,
+                batch_size=batch_size,
+                current_seq_len=total_seq_len,
+                d_model=self.hidden_dim,
+                num_heads=self.num_heads,
+                kv_heads=self.kv_heads,
+                intermediate_size=self.intermediate_size,
+                vocab_size=self.vocab_size,
+                model_type=self.model_type,
+            )
+
         transformer_timings, node_breakdown = self._build_decode_transformer_results(
             batch_size=batch_size,
             total_seq_len=total_seq_len,
-            gemm_shapes=gemm_shapes,
+            use_moe_layer=False,
+            gemm_shapes=decode_gemm_shapes_dense,
         )
+        moe_transformer_timings = None
+        moe_node_breakdown = None
+        if moe_layers_active:
+            moe_transformer_timings, moe_node_breakdown = self._build_decode_transformer_results(
+                batch_size=batch_size,
+                total_seq_len=total_seq_len,
+                use_moe_layer=True,
+                gemm_shapes=decode_gemm_shapes_moe,
+            )
 
-        output_act_bytes = gemm_shapes["qkv_proj"][0] * gemm_shapes["qkv_proj"][1] * self.precision_bytes
+        output_act_bytes = decode_gemm_shapes_dense["qkv_proj"][0] * decode_gemm_shapes_dense["qkv_proj"][1] * self.precision_bytes
         energy = self.calc_energy(transformer_timings, output_act_bytes)
 
         if self._generate_graphs:
@@ -366,20 +555,31 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
         return self._prepare_execution_graphs(
             node_breakdown=node_breakdown,
             transformer_timings=transformer_timings,
+            moe_node_breakdown=moe_node_breakdown,
+            moe_transformer_timings=moe_transformer_timings,
             batch_size=batch_size,
             seq_len=1,
             hidden_dim=self.hidden_dim,
-            intermediate_size=intermediate_size,
+            intermediate_size=self.intermediate_size,
             vocab_size=self.vocab_size,
             include_pipeline_backward=False,
             include_transformer_backward=False,
-            gemm_shapes=gemm_shapes,
+            gemm_shapes=decode_gemm_shapes_moe if self.use_moe else decode_gemm_shapes_dense,
         ), energy
     
     def calc_energy(self, transformer_timings: Dict[str, OperationTiming], cross_layer_comm) -> float:
         """
         Calculate energy consumption based on transformer results.
         """
+        if getattr(self, "use_moe", False) and not getattr(self, "_moe_energy_warning_emitted", False):
+            warning = (
+                "!!! WARNING: MoE energy estimates are not reliable.\n"
+                "!!! WARNING: Router/dispatch/combine (and some MoE-specific comms) are not modeled in energy.\n"
+                "!!! WARNING: Treat reported energy numbers as lower bounds for MoE runs."
+            )
+            print(warning)
+            self._moe_energy_warning_emitted = True
+        # NOTE: MoE energy estimation is incomplete; router/dispatch/combine are not modeled.
         total_flops = 0.0
         total_hbm_bytes = 0.0
         inter_comm_bytes = 0.0  # data parallelism?
@@ -406,7 +606,7 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
             total_hbm_bytes += op.forward.memory_accesses.get("L3", 0.0)
             inter_comm_bytes += op.forward.comm_bytes
 
-        total_comm_bytes = self.num_layers * inter_comm_bytes + (self.lp - 1) * cross_layer_comm
+        total_comm_bytes = self.num_layers * inter_comm_bytes + (self.pp - 1) * cross_layer_comm
 
         energy_per_flop = self.core.nominal_energy_per_flop
         energy_hbm_byte = self.DRAM.dynamic_energy_per_bit * 8
@@ -421,7 +621,7 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
 
 
 
-    def calc_time(self) -> float:
+    def calc_time(self) -> Tuple[float, float]:
         batch_size = self._effective_transformer_batch()
         vocab_size = self.vocab_size
         hidden_dim = self.hidden_dim
@@ -430,101 +630,143 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
         num_heads = self.num_heads
         intermediate_size = self.intermediate_size
         kv_heads = self.kv_heads
-        if prefill_len == 0:
-            print("Skipping prefill")
-            return 0.0
 
-        num_SMs = self.hw_config.tech_config.core.num_bundles
-        transformer_timings, node_breakdown = self.compute_all_gemm_and_node_times(
-            batch_size,
-            vocab_size,
-            hidden_dim,
-            prefill_len,
-            num_heads,
-            kv_heads,
-            intermediate_size,
-            num_SMs,
-        )
-
-        output_act_bytes = batch_size * self.seq_len * hidden_dim * self.precision_bytes
-
-        total_energy = self.calc_energy(transformer_timings, output_act_bytes)
-
-        head_dim = hidden_dim // num_heads
-        token_bytes = llm_util.kv_cache_token_bytes(
-            batch_size=batch_size,
-            kv_heads=self.kv_heads,
-            head_dim=head_dim,
-            precision_bytes=self.precision.kv_cache,
-        )
-
-        (
-            pipeline_graph,
-            pipeline_root,
-            _,
-            _,
-            transformer_graph,
-            transformer_forward_root,
-            _,
-            interconnect_params,
-        ) = self._prepare_execution_graphs(
-            node_breakdown=node_breakdown,
-            transformer_timings=transformer_timings,
-            batch_size=batch_size,
-            seq_len=prefill_len,
-            hidden_dim=hidden_dim,
-            intermediate_size=intermediate_size,
-            vocab_size=vocab_size,
-            include_pipeline_backward=False,
-            include_transformer_backward=False,
-        )
-
-        self.pipeline_graph = pipeline_graph
-        self.pipeline_root = pipeline_root
-        self.pipeline_interconnect = interconnect_params
-        self.transformer_graph = transformer_graph
-        self.transformer_forward_root = transformer_forward_root
-        self.transformer_backward_root = None
-        self.transformer_analytical_time_forward = node_breakdown.get("transformer_time_f")
-        self.transformer_analytical_time_backward = None
-
-        dispatcher = LLMExecutionDispatcher(
-            time_calc=self,
-            pipeline_graph=self.pipeline_graph,
-            pipeline_root=self.pipeline_root,
-            interconnect_params=self.pipeline_interconnect,
-            transformer_graph=self.transformer_graph,
-            transformer_forward_root=self.transformer_forward_root,
-            transformer_backward_root=self.transformer_backward_root,
-        )
-        mode = self.execution_mode
-        try:
-            result = dispatcher.run(mode)
-        except NotImplementedError as exc:
-            raise NotImplementedError(
-                f"{exc}. Selected execution mode '{mode.value}'."
-            ) from exc
-
-        self.pipeline_graph = dispatcher.pipeline_graph
-        self.pipeline_root = result.graph_root
-        self.pipeline_interconnect = dispatcher.interconnect_params
-
-        total_time = result.total_time
-
+        total_time = 0.0
+        total_energy = 0.0
+        prefill_peak_gb = 0.0
         mem_estimator = MemoryEstimator(self)
-        prefill_memory_data = mem_estimator.build_memory_data(
-            mode="inference",
-            batch_size=batch_size,
-            seq_len=prefill_len,
-            kv_cache_tokens=prefill_len,
-        )
-        prefill_root = dispatcher.build_flattened_root_for_memory()
-        _, prefill_peak_gb = mem_estimator.simulate_peak(
-            prefill_root,
-            prefill_memory_data,
-            mode="inference",
-            filename="memory_graph_prefill",
-        )
+
+        if prefill_len <= 0:
+            print("Skipping prefill")
+            self.pipeline_graph = None
+            self.pipeline_root = None
+            self.pipeline_interconnect = None
+            self.transformer_graph = None
+            self.transformer_forward_root = None
+            self.transformer_backward_root = None
+            self.transformer_graph_moe = None
+            self.transformer_forward_root_moe = None
+            self.transformer_backward_root_moe = None
+            self.transformer_analytical_time_forward = None
+            self.transformer_analytical_time_backward = None
+        else:
+            num_SMs = self.hw_config.tech_config.core.num_bundles
+            transformer_timings, node_breakdown = self.compute_all_gemm_and_node_times(
+                batch_size,
+                vocab_size,
+                hidden_dim,
+                prefill_len,
+                num_heads,
+                kv_heads,
+                intermediate_size,
+                num_SMs,
+                use_moe_override=False,
+            )
+            moe_transformer_timings = None
+            moe_node_breakdown = None
+            if self.use_moe and any(getattr(self, "moe_layer_mask", []) or []):
+                moe_transformer_timings, moe_node_breakdown = self.compute_all_gemm_and_node_times(
+                    batch_size,
+                    vocab_size,
+                    hidden_dim,
+                    prefill_len,
+                    num_heads,
+                    kv_heads,
+                    self.moe_intermediate_size,
+                    num_SMs,
+                    use_moe_override=True,
+                )
+
+            output_act_bytes = batch_size * prefill_len * hidden_dim * self.precision_bytes
+            total_energy = self.calc_energy(transformer_timings, output_act_bytes)
+
+            head_dim = getattr(self, "head_dim", None)
+            if head_dim is None:
+                head_dim = hidden_dim // num_heads
+            token_bytes = llm_util.kv_cache_token_bytes(
+                batch_size=batch_size,
+                kv_heads=self.kv_heads,
+                head_dim=head_dim,
+                precision_bytes=self.precision.kv_cache,
+            )
+
+            (
+                pipeline_graph,
+                pipeline_root,
+                _,
+                _,
+                transformer_graph,
+                transformer_forward_root,
+                transformer_backward_root,
+                moe_transformer_graph,
+                moe_transformer_forward_root,
+                moe_transformer_backward_root,
+                interconnect_params,
+            ) = self._prepare_execution_graphs(
+                node_breakdown=node_breakdown,
+                transformer_timings=transformer_timings,
+                moe_node_breakdown=moe_node_breakdown,
+                moe_transformer_timings=moe_transformer_timings,
+                batch_size=batch_size,
+                seq_len=prefill_len,
+                hidden_dim=hidden_dim,
+                intermediate_size=intermediate_size,
+                vocab_size=vocab_size,
+                include_pipeline_backward=False,
+                include_transformer_backward=False,
+            )
+
+            self.pipeline_graph = pipeline_graph
+            self.pipeline_root = pipeline_root
+            self.pipeline_interconnect = interconnect_params
+            self.transformer_graph = transformer_graph
+            self.transformer_forward_root = transformer_forward_root
+            self.transformer_backward_root = None
+            self.transformer_graph_moe = moe_transformer_graph
+            self.transformer_forward_root_moe = moe_transformer_forward_root
+            self.transformer_backward_root_moe = moe_transformer_backward_root
+            self.transformer_analytical_time_forward = node_breakdown.get("transformer_time_f")
+            self.transformer_analytical_time_backward = None
+
+            dispatcher = LLMExecutionDispatcher(
+                time_calc=self,
+                pipeline_graph=self.pipeline_graph,
+                pipeline_root=self.pipeline_root,
+                interconnect_params=self.pipeline_interconnect,
+                transformer_graph=self.transformer_graph,
+                transformer_forward_root=self.transformer_forward_root,
+                transformer_backward_root=self.transformer_backward_root,
+                moe_transformer_graph=self.transformer_graph_moe,
+                moe_transformer_forward_root=self.transformer_forward_root_moe,
+                moe_transformer_backward_root=self.transformer_backward_root_moe,
+            )
+            mode = self.execution_mode
+            try:
+                result = dispatcher.run(mode)
+            except NotImplementedError as exc:
+                raise NotImplementedError(
+                    f"{exc}. Selected execution mode '{mode.value}'."
+                ) from exc
+
+            self.pipeline_graph = dispatcher.pipeline_graph
+            self.pipeline_root = result.graph_root
+            self.pipeline_interconnect = dispatcher.interconnect_params
+
+            total_time = result.total_time
+
+            prefill_memory_data = mem_estimator.build_memory_data(
+                mode="inference",
+                batch_size=batch_size,
+                seq_len=prefill_len,
+                kv_cache_tokens=prefill_len,
+            )
+            prefill_root = dispatcher.build_flattened_root_for_memory()
+            _, prefill_peak_gb = mem_estimator.simulate_peak(
+                prefill_root,
+                prefill_memory_data,
+                mode="inference",
+                filename="memory_graph_prefill",
+            )
 
         decode_peak_gb = prefill_peak_gb
         if decode_len > 0:
@@ -535,7 +777,7 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
                 d_model=hidden_dim,
                 num_heads=num_heads,
                 kv_heads=kv_heads,
-                intermediate_size=intermediate_size,
+                intermediate_size=self.moe_intermediate_size if self.use_moe else intermediate_size,
                 vocab_size=vocab_size,
                 model_type=self.model_type,
             )
@@ -547,6 +789,9 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
                 decode_transformer_graph,
                 decode_transformer_forward_root,
                 decode_transformer_backward_root,
+                decode_moe_transformer_graph,
+                decode_moe_transformer_forward_root,
+                decode_moe_transformer_backward_root,
                 decode_interconnect_params,
             ), _ = self.prepare_decode_graphs(
                 batch_size=batch_size,
@@ -561,6 +806,9 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
                 transformer_graph=decode_transformer_graph,
                 transformer_forward_root=decode_transformer_forward_root,
                 transformer_backward_root=decode_transformer_backward_root,
+                moe_transformer_graph=decode_moe_transformer_graph,
+                moe_transformer_forward_root=decode_moe_transformer_forward_root,
+                moe_transformer_backward_root=decode_moe_transformer_backward_root,
             )
             decode_memory_root = decode_dispatcher.build_flattened_root_for_memory()
             decode_memory_data = mem_estimator.build_memory_data(
@@ -656,10 +904,10 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
             use_moe=self.use_moe,
             num_experts=self.moe_num_experts,
             top_k=self.moe_top_k,
-            dp=self.dp,
-            lp=self.lp,
+            pp=self.pp,
             tp=self.tp,
             tp_sp=self.tp_sp,
+            moe_dp=self.moe_dp,
             sample_every=sample_every,
         )
 
@@ -694,7 +942,9 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
         if decode_samples:
             time_to_first_token += decode_samples[0].execution_time
 
-        head_dim = self.hidden_dim // self.num_heads
+        head_dim = getattr(self, "head_dim", None)
+        if head_dim is None:
+            head_dim = self.hidden_dim // self.num_heads
         token_bytes = llm_util.kv_cache_token_bytes(
             batch_size=self._effective_transformer_batch(),
             kv_heads=self.kv_heads,

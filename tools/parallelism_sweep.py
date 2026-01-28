@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# Copyright 2026 NanoCad lab, UCLA
+# https://nanocad.ee.ucla.edu/
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Parallelism sweep utility for RAPID-LLM LLM configurations.
 
@@ -38,6 +53,7 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 from train_timing import TimeCalculationLLM
+from inference_timing import TimeCalculationLLMInference
 from llm_util import process_gemm_shapes
 
 import seaborn as sns
@@ -53,19 +69,19 @@ plt.rcParams.update({"font.size": 13})
 # -----------------------------------------------------------------------------
 
 # Paths to the baseline configuration files
-HARDWARE_CONFIG_PATH = "configs/hardware-config/a100_80GB.yaml"
-HARDWARE_CONFIG_DIR = "configs/hardware-config"
+HARDWARE_CONFIG_PATH = "validation_scripts/validation_configs/hardware-config/a100_80GB_para_sweep.yaml"
+HARDWARE_CONFIG_DIR = "validation_scripts/validation_configs/hardware-config"
 HW_CONFIGS = []  # Optional: list of hardware configs to sweep; if empty, uses HARDWARE_CONFIG_PATH.
 HW_LABELS = []   # Optional: labels aligned with HW_CONFIGS.
-MODEL_CONFIG_PATH = "configs/model-config/Llama3.1-405B.yaml"
+MODEL_CONFIG_PATH = "validation_scripts/validation_configs/model-config/Llama3.1-405B.yaml"
 
 # Parallelism values to sweep (dense grid). Edit to suit your search space.
-# Keys should match the entries under the YAML "parallelism" section.
+# Values map to the training parallelism block (parallelism.train.dp, etc.).
 PARALLELISM_SWEEP = {
-    "tp": [2**i for i in range(0, 6)],
-    "cp": [2**i for i in range(0, 6)],
+    "tp": [2**i for i in range(0, 7)],
+    "cp": [2**i for i in range(0, 7)],
     "dp": [2**i for i in range(0, 11)],
-    "lp": [2**i for i in range(0, 5)],
+    "pp": [2**i for i in range(0, 6)],
 }
 
 # Optional knobs that still live inside the parallelism section but do not
@@ -74,12 +90,12 @@ OTHER_PARALLELISM_OPTIONS = {
     "tp_sp": [True],
 }
 
-# GPU count filter: only evaluate combinations whose TP*CP*DP*LP fall inside
+# GPU count filter: only evaluate combinations whose TP*CP*DP*PP fall inside
 # this inclusive range.
 GPU_COUNT_MIN = 128
-GPU_COUNT_MAX = 2048
+GPU_COUNT_MAX = 4096
 TP_CP_PRODUCT_MIN = 1  # Optional: set to int to filter tp*cp below this threshold.
-TP_CP_PRODUCT_MAX = 128  # Optional: set to int to filter tp*cp above this threshold.
+TP_CP_PRODUCT_MAX = 512  # Optional: set to int to filter tp*cp above this threshold.
 
 # When True, discard configurations whose tp*cp product is not a square power of two.
 ENFORCE_SQUARE_TP_CP = False
@@ -96,6 +112,8 @@ PLOT_JITTER_WIDTH = 0.175
 # Swarm/point styling for better visibility.
 PLOT_POINT_SIZE = 5.0
 PLOT_POINT_EDGE = 0.2
+# Drop points slower than this multiple of the per-GPU best runtime (plot only).
+PLOT_RUNTIME_RATIO_CUTOFF = 10.0
 
 # Default output artefacts
 PLOT_OUTPUT_PATH = "tools/parallelism_sweep.png"
@@ -106,19 +124,19 @@ BEST_RUNTIME_PER_GPU_DIR = "tools/parallelism_best_runtimes_per_gpu"
 BEST_RUNTIME_PER_GPU_COMBINED_PATH = "tools/parallelism_best_runtimes_per_gpu_combined.png"
 BEST_SPEEDUP_PER_GPU_COMBINED_PATH = "tools/parallelism_speedup_per_gpu_combined.png"
 RUNTIME_CACHE_PATH = "tools/parallelism_sweep_cache.csv"
-PLOT_TITLE = "Parallelism sweep – beeswarm on log2(GPUs) categories"
+PLOT_TITLE = "Parallelism options vs runtime"
 
 # AstraSim cache handling within RAPID-LLM (mirrors run_perf default options).
 ASTRA_CACHE_MODE = "NO_CACHE"  # Options: NO_CACHE, CACHE_READONLY, CACHE_READWRITE
 
 # Plotting behaviour toggles
 MEM_AWARE_FILTER = False  # When True, skip memory-violating configurations in plots.
-EVALUATE_MEMORY_EXCEEDED = False  # When True, still compute runtime even if memory limits are exceeded (may crash).
+EVALUATE_MEMORY_EXCEEDED = True  # When True, still compute runtime even if memory limits are exceeded (may crash).
 
 # Maximum number of parallel worker processes (set <= available CPUs - 1). Set to 1 to disable multiprocessing.
-MAX_WORKERS = 55
+MAX_WORKERS = 60
 # When True, use a thread pool instead of a process pool (more stable, avoids worker crashes at the cost of GIL contention).
-USE_THREADPOOL = True
+USE_THREADPOOL = False
 
 
 # -----------------------------------------------------------------------------
@@ -127,7 +145,7 @@ USE_THREADPOOL = True
 
 def add_rgb_ternary_legend(ax,
                            corner_labels=("R = log2(tp+cp)",
-                                          "G = log2(lp)",
+                                          "G = log2(pp)",
                                           "B = log2(dp)"),
                            gamma=0.85,
                            inset_xywh=(0.72, 0.58, 0.24, 0.24),  # Axes fraction: x, y, w, h
@@ -354,11 +372,41 @@ def cartesian_product(option_map):
         yield dict(zip(keys, values))
 
 
+def build_parallelism_settings(flat_settings: Dict[str, object]) -> Dict[str, object]:
+    parallelism: Dict[str, object] = {}
+    for key in ("tp", "cp", "pp", "mb", "tp_sp"):
+        if key in flat_settings:
+            parallelism[key] = flat_settings[key]
+    train_block = {
+        "dp": int(flat_settings.get("dp", 1) or 1),
+        "ep": int(flat_settings.get("ep", 1) or 1),
+        "tp_ep": bool(flat_settings.get("tp_ep", True)),
+    }
+    parallelism["train"] = train_block
+    parallelism["inference"] = {
+        "replica_count": int(flat_settings.get("replica_count", 1) or 1),
+        "moe_dp": int(flat_settings.get("moe_dp", 1) or 1),
+    }
+    return parallelism
+
+
+def _parallelism_snapshot(parallelism: Dict[str, object]) -> Dict[str, int]:
+    train_block = parallelism.get("train")
+    if not isinstance(train_block, dict) or "dp" not in train_block:
+        raise ValueError("parallelism.train.dp must be set for sweep entries.")
+    return {
+        "tp": int(parallelism.get("tp", 1) or 1),
+        "cp": int(parallelism.get("cp", 1) or 1),
+        "dp": int(train_block["dp"]),
+        "pp": int(parallelism.get("pp", 1) or 1),
+    }
+
+
 def total_gpu_count(parallel_cfg):
+    values = _parallelism_snapshot(parallel_cfg)
     total = 1
-    for axis in ("tp", "cp", "dp", "lp"):
-        value = int(parallel_cfg.get(axis, 1) or 1)
-        total *= max(1, value)
+    for axis in ("tp", "cp", "dp", "pp"):
+        total *= max(1, int(values.get(axis, 1)))
     return total
 
 
@@ -384,8 +432,24 @@ def make_temp_hw_config(base_hw_dict, parallel_settings, hw_mutator=None):
     """Return (parsed HW config, YAML string) for the given override."""
     updated = copy.deepcopy(base_hw_dict)
     parallel_block = updated.setdefault("parallelism", {})
-    for key, value in parallel_settings.items():
-        parallel_block[key] = value
+    for key in ("tp", "cp", "pp", "mb", "tp_sp"):
+        if key in parallel_settings:
+            parallel_block[key] = parallel_settings[key]
+
+    train_settings = parallel_settings.get("train")
+    if not isinstance(train_settings, dict):
+        raise ValueError("parallelism.train is required for sweep entries")
+    train_block = parallel_block.setdefault("train", {})
+    train_block["dp"] = int(train_settings["dp"])
+    train_block["ep"] = int(train_settings.get("ep", 1))
+    train_block["tp_ep"] = bool(train_settings.get("tp_ep", True))
+
+    inference_settings = parallel_settings.get("inference")
+    if not isinstance(inference_settings, dict):
+        raise ValueError("parallelism.inference is required for sweep entries")
+    inference_block = parallel_block.setdefault("inference", {})
+    inference_block["replica_count"] = int(inference_settings["replica_count"])
+    inference_block["moe_dp"] = int(inference_settings["moe_dp"])
 
     if hw_mutator:
         hw_mutator(updated)
@@ -414,16 +478,17 @@ def make_temp_hw_config(base_hw_dict, parallel_settings, hw_mutator=None):
 def _rgb_from_parallelism(entries, gamma: float = 0.85):
     """
     Build per-point RGBA colors using:
-      R = log2(tp+cp), G = log2(lp), B = log2(dp)
+      R = log2(tp+cp), G = log2(pp), B = log2(dp)
     Each channel is min-max normalized over the dataset, then gamma-adjusted.
     """
-    tps = np.array([max(1, int(e["parallelism"].get("tp", 1))) for e in entries], dtype=float)
-    cps = np.array([max(1, int(e["parallelism"].get("cp", 1))) for e in entries], dtype=float)
-    dps = np.array([max(1, int(e["parallelism"].get("dp", 1))) for e in entries], dtype=float)
-    lps = np.array([max(1, int(e["parallelism"].get("lp", 1))) for e in entries], dtype=float)
+    snapshots = [_parallelism_snapshot(e["parallelism"]) for e in entries]
+    tps = np.array([max(1, int(snap["tp"])) for snap in snapshots], dtype=float)
+    cps = np.array([max(1, int(snap["cp"])) for snap in snapshots], dtype=float)
+    dps = np.array([max(1, int(snap["dp"])) for snap in snapshots], dtype=float)
+    pps = np.array([max(1, int(snap["pp"])) for snap in snapshots], dtype=float)
 
     r_raw = np.log2(tps + cps)
-    g_raw = np.log2(lps)
+    g_raw = np.log2(pps)
     b_raw = np.log2(dps)
 
     def _norm(x):
@@ -535,6 +600,39 @@ def evaluate_parallelism(hw_dict, model_config_obj, mode, parallel_settings, hw_
             # print(f"Warning: failed to write debug.yaml: {exc}", file=sys.stderr)
     temp_dir = tempfile.mkdtemp(prefix="parallelism_sweep_")
     try:
+        run_type = str(getattr(getattr(model_config_obj, "model_config", None), "run_type", "training")).lower()
+        if run_type == "inference":
+            calculator = TimeCalculationLLMInference(hw_config, model_config_obj, mode, output_dir=temp_dir)
+            with open(os.devnull, "w") as devnull, redirect_stdout(devnull), redirect_stderr(devnull):
+                inference_timing = calculator.calc_total_inference_time()
+                runtime = float(inference_timing["total_inference_time"])
+            mem_exceeded = bool(getattr(calculator, "memory_capacity_exceeded", False))
+            mem_violation = float(getattr(calculator, "memory_capacity_violation_gb", 0.0) or 0.0)
+            if mem_exceeded and not EVALUATE_MEMORY_EXCEEDED:
+                return {
+                    "runtime": float("nan"),
+                    "performance": float("nan"),
+                    "total_flops": float("nan"),
+                    "peak_flops": gpu_peak_flops(hw_config),
+                    "mfu": float("nan"),
+                    "achieved_flops": float("nan"),
+                    "memory_exceeded": True,
+                    "memory_violation_gb": mem_violation,
+                    "hw_yaml": debug_yaml,
+                }
+            performance = (1.0 / runtime) if runtime > 0.0 else float("nan")
+            return {
+                "runtime": runtime,
+                "performance": performance,
+                "total_flops": float("nan"),
+                "peak_flops": gpu_peak_flops(hw_config),
+                "mfu": float("nan"),
+                "achieved_flops": float("nan"),
+                "memory_exceeded": mem_exceeded,
+                "memory_violation_gb": mem_violation,
+                "hw_yaml": debug_yaml,
+            }
+
         calculator = TimeCalculationLLM(hw_config, model_config_obj, mode, output_dir=temp_dir)
         mem_exceeded = bool(getattr(calculator, "memory_capacity_exceeded", False))
         mem_violation = float(getattr(calculator, "memory_capacity_violation_gb", 0.0) or 0.0)
@@ -731,6 +829,36 @@ def _gpu_exp(n: int) -> float:
     return math.log2(float(n))
 
 
+def _filter_by_runtime_ratio(
+    entries: List[Dict[str, object]],
+    ratio: float,
+) -> List[Dict[str, object]]:
+    if ratio <= 0:
+        return list(entries)
+    best_by_gpu: Dict[int, float] = {}
+    for item in entries:
+        runtime_val = float(item.get("runtime", float("nan")))
+        if not math.isfinite(runtime_val) or runtime_val <= 0:
+            continue
+        ng = int(item.get("num_gpus", 0))
+        best = best_by_gpu.get(ng)
+        if best is None or runtime_val < best:
+            best_by_gpu[ng] = runtime_val
+    if not best_by_gpu:
+        return list(entries)
+    filtered: List[Dict[str, object]] = []
+    for item in entries:
+        ng = int(item.get("num_gpus", 0))
+        best = best_by_gpu.get(ng)
+        runtime_val = float(item.get("runtime", float("nan")))
+        if best is None:
+            filtered.append(item)
+            continue
+        if math.isfinite(runtime_val) and runtime_val <= ratio * best:
+            filtered.append(item)
+    return filtered
+
+
 def plot_results(results, output_path):
     if not results:
         print("No successful configurations to plot.", file=sys.stderr)
@@ -742,6 +870,10 @@ def plot_results(results, output_path):
         if not plot_entries:
             print("Warning: all configurations violate memory limits; skipping plot.", file=sys.stderr)
             return
+    plot_entries = _filter_by_runtime_ratio(plot_entries, PLOT_RUNTIME_RATIO_CUTOFF)
+    if not plot_entries:
+        print("Warning: no configurations remain after runtime ratio filtering; skipping plot.", file=sys.stderr)
+        return
 
     metric_key = "runtime" if PLOT_METRIC.lower() == "runtime" else "performance"
 
@@ -756,6 +888,7 @@ def plot_results(results, output_path):
     rows = []
     for i, item in enumerate(plot_entries):
         p = item["parallelism"]
+        snap = _parallelism_snapshot(p)
         ng = int(item["num_gpus"])
         metric_val = float(item[metric_key])
         if not math.isfinite(metric_val):
@@ -764,10 +897,10 @@ def plot_results(results, output_path):
             "row_id": i,
             "num_gpus": ng,
             "gpu_exp": _gpu_exp(ng),
-            "tp": int(p.get("tp", 1)),
-            "cp": int(p.get("cp", 1)),
-            "dp": int(p.get("dp", 1)),
-            "lp": int(p.get("lp", 1)),
+            "tp": snap["tp"],
+            "cp": snap["cp"],
+            "dp": snap["dp"],
+            "pp": snap["pp"],
             "memory_exceeded": bool(item.get("memory_exceeded", False)),
             metric_key: metric_val,
         })
@@ -777,14 +910,14 @@ def plot_results(results, output_path):
     order = sorted(df["gpu_exp"].unique())
     df["gpu_exp_cat"] = pd.Categorical(df["gpu_exp"], categories=order, ordered=True)
 
-    # --- Per-point RGB colors: R=log2(tp+cp), G=log2(lp), B=log2(dp) ---
+    # --- Per-point RGB colors: R=log2(tp+cp), G=log2(pp), B=log2(dp) ---
     tps = df["tp"].to_numpy(dtype=float)
     cps = df["cp"].to_numpy(dtype=float)
     dps = df["dp"].to_numpy(dtype=float)
-    lps = df["lp"].to_numpy(dtype=float)
+    pps = df["pp"].to_numpy(dtype=float)
 
     r_raw = np.log2(tps + cps)
-    g_raw = np.log2(lps)
+    g_raw = np.log2(pps)
     b_raw = np.log2(dps)
 
     def _norm(x, gamma=0.85):
@@ -847,7 +980,7 @@ def plot_results(results, output_path):
         )
     # add_rgb_ternary_legend(
     #     ax,
-    #     corner_labels=("R = log2(tp+cp)", "G = log2(lp)", "B = log2(dp)"),
+    #     corner_labels=("R = log2(tp+cp)", "G = log2(pp)", "B = log2(dp)"),
     #     gamma=0.85,                      # match your _rgb_from_parallelism gamma
     #     inset_xywh=(0.70, 0.50, 0.26, 0.26)  # tweak position/size to taste
     # )
@@ -887,7 +1020,7 @@ def plot_results(results, output_path):
 
     # Reminder of color encoding
     ax.text(0.99, 0.01,
-            "Color: R=log2(tp+cp), G=log2(lp), B=log2(dp)",
+            "Color: R=log2(tp+cp), G=log2(pp), B=log2(dp)",
             transform=ax.transAxes, ha="right", va="bottom", fontsize=9, alpha=0.8)
 
     # Per-GPU-count best runtime markers (exclude memory violations)
@@ -1119,7 +1252,7 @@ def plot_speedup_per_gpu_combined(
 #             "tp": int(p.get("tp", 1)),
 #             "cp": int(p.get("cp", 1)),
 #             "dp": int(p.get("dp", 1)),
-#             "lp": int(p.get("lp", 1)),
+#             "pp": int(p.get("pp", 1)),
 #         })
 #     df = pd.DataFrame(df_rows)
 
@@ -1183,7 +1316,7 @@ def plot_speedup_per_gpu_combined(
 
 #     # Small caption to recall color encoding
 #     ax.text(0.99, 0.01,
-#             "Color channels: R=log2(tp+cp), G=log2(lp), B=log2(dp)",
+#             "Color channels: R=log2(tp+cp), G=log2(pp), B=log2(dp)",
 #             transform=ax.transAxes, ha="right", va="bottom", fontsize=9, alpha=0.8)
 
 #     plt.tight_layout()
@@ -1233,7 +1366,8 @@ def _worker_init(hw_dict, model_config_path, mode):
 
 
 def _worker_task(parallel_items: Tuple[Tuple[str, object], ...]):
-    parallel_settings = {k: v for k, v in parallel_items}
+    flat_settings = {k: v for k, v in parallel_items}
+    parallel_settings = build_parallelism_settings(flat_settings)
     try:
         metrics = evaluate_parallelism(
             _GLOBAL_HW_DICT,
@@ -1280,7 +1414,7 @@ def _build_tasks(
             settings: Dict[str, object] = {}
             settings.update(gpu_choice)
             settings.update(other_choice)
-            settings["mb"] = settings.get("lp", 1)
+            settings["mb"] = settings.get("pp", 1)
             tasks.append(tuple(sorted(settings.items())))
     return tasks
 
@@ -1338,7 +1472,7 @@ def main():
     skipped_out_of_range = 0
     skipped_square_constraint = 0
     for items in task_items:
-        settings = dict(items)
+        settings = build_parallelism_settings(dict(items))
         num_gpus = total_gpu_count(settings)
         if enforce_square and not tp_cp_product_is_power_of_two_square(settings.get("tp"), settings.get("cp")):
             skipped_square_constraint += 1
@@ -1454,7 +1588,7 @@ def main():
             try:
                 tasks_to_eval: List[Tuple[Tuple[str, object], ...]] = []
                 for items in filtered_tasks:
-                    settings = dict(items)
+                    settings = build_parallelism_settings(dict(items))
                     num_gpus = total_gpu_count(settings)
                     key = _cache_key(hw_path, model_cache_id, settings)
                     cached_entry = runtime_cache.get(key)
@@ -1581,7 +1715,7 @@ def main():
                     model_config_obj = config.parse_config(model_config_path, config_type=mode)
                     with tqdm(total=len(tasks_to_eval), desc="Evaluating", unit="config") as progress:
                         for items in tasks_to_eval:
-                            settings = dict(items)
+                            settings = build_parallelism_settings(dict(items))
                             num_gpus = total_gpu_count(settings)
                             progress.update(1)
                             try:

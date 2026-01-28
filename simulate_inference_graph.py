@@ -1,3 +1,18 @@
+# Copyright 2026 NanoCad lab, UCLA
+# https://nanocad.ee.ucla.edu/
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 LLM Inference Simulation - Extended Graph Generation for Prefill + Decode
 
@@ -32,8 +47,8 @@ class InferenceConfig:
     top_k: int
 
     
-    dp: int = 1  # data parallel (acts as replica count during inference)
-    lp: int = 1  # layer parallel
+    moe_dp: int = 1  # inference expert pool expansion (used to size MoE routing group)
+    pp: int = 1  # layer parallel
     tp: int = 1  # tensor parallel degree
     cp: int = 1  # context parallel degree
     tp_sp: bool = False  # sequence-parallel toggle
@@ -80,10 +95,15 @@ class DecodeGraph(Graph):
         self.use_moe = config.use_moe
         self.num_experts = config.num_experts
         self.top_k = config.top_k
-        # # Mirror MoE configuration expected by shared GEMM utilities
-        # self.use_moe = bool(getattr(config, "use_moe", False))
-        # self.num_experts = getattr(config, "num_experts", 1) or 1
-        # self.top_k = getattr(config, "top_k", 1) or 1
+        # Mirror MoE configuration expected by shared GEMM utilities
+        self.moe_num_experts = int(getattr(config, "num_experts", 1) or 1)
+        self.moe_top_k = int(getattr(config, "top_k", 1) or 1)
+        model_cfg = getattr(model_config, "model_config", None)
+        self.moe_intermediate_size = int(
+            getattr(model_cfg, "moe_intermediate_size", getattr(config, "intermediate_size", 0))
+        )
+        self.n_shared_experts = int(getattr(model_cfg, "n_shared_experts", 0) or 0)
+        self.head_dim = getattr(model_cfg, "head_dim", None)
 
     def build_decode_graph(self) -> Tuple[float, List[DecodeSample]]:
         """
@@ -111,7 +131,7 @@ class DecodeGraph(Graph):
                 d_model=self.config.hidden_dim,
                 num_heads=self.config.num_heads,
                 kv_heads=self.config.kv_heads,
-                intermediate_size=self.config.intermediate_size,
+                intermediate_size=self.moe_intermediate_size if self.use_moe else self.config.intermediate_size,
                 vocab_size=self.config.vocab_size,
                 model_type=self.model_config.model_config.model_type,
             )
@@ -193,6 +213,11 @@ class DecodeGraph(Graph):
             prev_output_dir = temp_time_calc.output_dir
             temp_time_calc.output_dir = sample_dir
 
+        execution_graphs, energy = temp_time_calc.prepare_decode_graphs(
+            batch_size=self.config.batch_size,
+            total_seq_len=total_seq_len,
+            gemm_shapes=gemm_shapes,
+        )
         (
             pipeline_graph,
             pipeline_root,
@@ -201,12 +226,11 @@ class DecodeGraph(Graph):
             transformer_graph,
             transformer_forward_root,
             transformer_backward_root,
+            moe_transformer_graph,
+            moe_transformer_forward_root,
+            moe_transformer_backward_root,
             interconnect_params,
-        ), energy = temp_time_calc.prepare_decode_graphs(
-            batch_size=self.config.batch_size,
-            total_seq_len=total_seq_len,
-            gemm_shapes=gemm_shapes,
-        )
+        ) = execution_graphs
 
         dispatcher = LLMExecutionDispatcher(
             time_calc=temp_time_calc,
@@ -216,6 +240,9 @@ class DecodeGraph(Graph):
             transformer_graph=transformer_graph,
             transformer_forward_root=transformer_forward_root,
             transformer_backward_root=transformer_backward_root,
+            moe_transformer_graph=moe_transformer_graph,
+            moe_transformer_forward_root=moe_transformer_forward_root,
+            moe_transformer_backward_root=moe_transformer_backward_root,
         )
 
         result = dispatcher.run(temp_time_calc.execution_mode)
@@ -337,10 +364,11 @@ class InferenceEngine:
         self.decode_graph = DecodeGraph(
             config=self.config,
             mode="inference",
-            dp=self.config.dp,
-            lp=self.config.lp,
+            dp=1,
+            pp=self.config.pp,
             tp=self.config.tp,
             cp=self.config.cp,
+            ep=self.config.moe_dp,
             comp_times={},
             comm_metadata={},
             misc_metadata={

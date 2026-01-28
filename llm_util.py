@@ -1,3 +1,18 @@
+# Copyright 2026 NanoCad lab, UCLA
+# https://nanocad.ee.ucla.edu/
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 
 import math
 import os
@@ -30,6 +45,37 @@ def reshape_gemm_to_3d(arg):
 
 ATTENTION_GEMM_KEYS = {"attention_score", "attention_output"}
 
+_LLAMA_STYLE_MODEL_TYPES = {"llama", "glm4_moe", "glm4", "glm"}
+_GLM_MODEL_TYPES = {"glm4_moe", "glm4", "glm"}
+
+
+def is_llama_style(model_type) -> bool:
+    return str(model_type or "").strip().lower() in _LLAMA_STYLE_MODEL_TYPES
+
+
+def is_glm_style(model_type) -> bool:
+    return str(model_type or "").strip().lower() in _GLM_MODEL_TYPES
+
+
+def resolve_head_dim(hidden_dim, num_heads, head_dim=None) -> int:
+    if head_dim is None:
+        if hidden_dim % num_heads != 0:
+            raise ValueError("hidden_dim must be divisible by num_heads when head_dim is not provided")
+        return hidden_dim // num_heads
+    head_dim = int(head_dim)
+    if head_dim <= 0:
+        raise ValueError("head_dim must be a positive integer")
+    return head_dim
+
+
+def attention_dim_sizes(hidden_dim, num_heads, kv_heads, head_dim=None):
+    if kv_heads is None:
+        kv_heads = num_heads
+    head_dim = resolve_head_dim(hidden_dim, num_heads, head_dim=head_dim)
+    q_size = num_heads * head_dim
+    kv_size = kv_heads * head_dim
+    return head_dim, q_size, kv_size
+
 
 def multihead_decoder_gemm(self, batch_size, seq_len, d_model, num_heads, kv_heads, intermediate_size, vocab_size, model_type="gpt"):
     """
@@ -47,13 +93,17 @@ def multihead_decoder_gemm(self, batch_size, seq_len, d_model, num_heads, kv_hea
 
 
     """
-    assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
     assert num_heads % kv_heads == 0, "num_heads must be divisible by kv_heads"
-    head_dim = d_model // num_heads
+    head_dim, q_size, kv_size = attention_dim_sizes(
+        d_model,
+        num_heads,
+        kv_heads,
+        head_dim=getattr(self, "head_dim", None),
+    )
     shared_heads = num_heads // kv_heads # how many heads share the same K,V
     gemms = OrderedDict()
 
-    gemms["qkv_proj"] = (batch_size, seq_len, d_model, (2 * kv_heads + num_heads) * head_dim)
+    gemms["qkv_proj"] = (batch_size, seq_len, d_model, q_size + 2 * kv_size)
 
     gemms["attention_score"] = (
         batch_size * kv_heads,
@@ -68,17 +118,17 @@ def multihead_decoder_gemm(self, batch_size, seq_len, d_model, num_heads, kv_hea
         seq_len,
         head_dim,
     )
-    gemms["output_proj"] = (batch_size, seq_len, d_model, d_model)
-    if str(model_type).lower() == "llama":
+    gemms["output_proj"] = (batch_size, seq_len, q_size, d_model)
+    if is_llama_style(model_type):
         projected_dim = 2 * intermediate_size
     else:
         projected_dim = intermediate_size
     if self.use_moe:
-        # assuming equal load balancing here
-        num_experts = max(1, int(getattr(self, "moe_num_experts", 1)))
-        top_k = max(1, int(getattr(self, "moe_top_k", 1)))
-        gemms["ffn1"] = (batch_size, seq_len * top_k / num_experts, d_model, projected_dim ) #gemm shape per expert assuming each dp group has all experts
-        gemms["ffn2"] = (batch_size, seq_len * top_k / num_experts, intermediate_size, d_model)
+        moe_intermediate = int(getattr(self, "moe_intermediate_size", intermediate_size))
+        projected_dim = 2 * moe_intermediate if is_llama_style(model_type) else moe_intermediate
+        # MoE GEMM shapes use token-owner dimensions; token dispatch is modeled in timing logic.
+        gemms["ffn1"] = (batch_size, seq_len, d_model, projected_dim)
+        gemms["ffn2"] = (batch_size, seq_len, moe_intermediate, d_model)
     else:
         gemms["ffn1"] = (batch_size, seq_len, d_model, projected_dim)
         gemms["ffn2"] = (batch_size, seq_len, intermediate_size, d_model) 
@@ -126,13 +176,15 @@ def process_gemm_shapes(self, batch_size, seq_len, d_model, num_heads, kv_heads,
 def get_transformer_mem_layer(
     dp,
     tp,
-    lp=1,
+    pp=1,
     mb=1,
     batch_size=1,
     hidden_dim=1,
     seq_len=1,
     intermediate_size=1,
     n_heads=1,
+    kv_heads=None,
+    head_dim=None,
     precision=None,
     zero_stage=0,
     flash_attention=False,
@@ -150,9 +202,19 @@ def get_transformer_mem_layer(
         act_memory_layer = seq_len * batch_size * hidden_dim * (34 / tp + 5 * n_heads * seq_len/(hidden_dim * tp) ) * (precision.activations / 2)
 
     act_memory_layer_inf = seq_len * batch_size * intermediate_size / tp * precision.activations  #inference max activation memory, no need to store for backpropagation
-    ffn_proj_factor = 3 if str(model_type).lower() == "llama" else 2
-    
-    transformer_param_layer = 4* hidden_dim * hidden_dim + intermediate_size * ffn_proj_factor * hidden_dim  # weights Wq,Wk,Wv,Wo,ffn
+    ffn_proj_factor = 3 if is_llama_style(model_type) else 2
+
+    if kv_heads is None:
+        kv_heads = n_heads
+    if is_glm_style(model_type):
+        head_dim = resolve_head_dim(hidden_dim, n_heads, head_dim=head_dim)
+        q_size = n_heads * head_dim
+        kv_size = kv_heads * head_dim
+        attention_params = (hidden_dim * (q_size + 2 * kv_size)) + (q_size * hidden_dim)
+    else:
+        attention_params = 4 * hidden_dim * hidden_dim
+
+    transformer_param_layer = attention_params + intermediate_size * ffn_proj_factor * hidden_dim  # weights Wq,Wk,Wv,Wo,ffn
 
     optimizer_mem = (precision.optimizer_states * 2 + precision.activations) * transformer_param_layer / tp # don't divide by dp for DDP, NeMo ZeRO-1 optimizer style
     tensor_weight_memory_layer = transformer_param_layer * precision.parameters / tp #weight memory
@@ -253,9 +315,13 @@ def estimate_inference_memory(exp_hw_config, exp_model_config, **kwargs):
         _set_if_present(model_cfg, key, key)
 
     if sched_cfg is not None:
-        for key in ("dp", "tp", "cp", "lp", "mb"):
+        for key in ("tp", "cp", "pp", "mb"):
             if key in kwargs and hasattr(sched_cfg, key):
                 setattr(sched_cfg, key, int(kwargs[key]))
+        if "moe_dp" in kwargs:
+            sched_cfg.inference.moe_dp = int(kwargs["moe_dp"])
+        if "replica_count" in kwargs:
+            sched_cfg.inference.replica_count = int(kwargs["replica_count"])
 
     from inference_timing import TimeCalculationLLMInference
     from llm_execution import LLMExecutionDispatcher
@@ -287,7 +353,22 @@ def estimate_inference_memory(exp_hw_config, exp_model_config, **kwargs):
             kv_heads,
             intermediate_size,
             num_SMs,
+            use_moe_override=False,
         )
+        moe_transformer_timings = None
+        moe_node_breakdown = None
+        if tc.use_moe and any(getattr(tc, "moe_layer_mask", []) or []):
+            moe_transformer_timings, moe_node_breakdown = tc.compute_all_gemm_and_node_times(
+                batch_size,
+                vocab_size,
+                hidden_dim,
+                prefill_len,
+                num_heads,
+                kv_heads,
+                tc.moe_intermediate_size,
+                num_SMs,
+                use_moe_override=True,
+            )
         (
             pipeline_graph,
             pipeline_root,
@@ -296,10 +377,15 @@ def estimate_inference_memory(exp_hw_config, exp_model_config, **kwargs):
             transformer_graph,
             transformer_forward_root,
             transformer_backward_root,
+            moe_transformer_graph,
+            moe_transformer_forward_root,
+            moe_transformer_backward_root,
             interconnect_params,
         ) = tc._prepare_execution_graphs(
             node_breakdown=node_breakdown,
             transformer_timings=transformer_timings,
+            moe_node_breakdown=moe_node_breakdown,
+            moe_transformer_timings=moe_transformer_timings,
             batch_size=batch_size,
             seq_len=prefill_len,
             hidden_dim=hidden_dim,
@@ -316,6 +402,9 @@ def estimate_inference_memory(exp_hw_config, exp_model_config, **kwargs):
             transformer_graph=transformer_graph,
             transformer_forward_root=transformer_forward_root,
             transformer_backward_root=transformer_backward_root,
+            moe_transformer_graph=moe_transformer_graph,
+            moe_transformer_forward_root=moe_transformer_forward_root,
+            moe_transformer_backward_root=moe_transformer_backward_root,
         )
         prefill_root = dispatcher.build_flattened_root_for_memory()
         prefill_memory_data = mem_estimator.build_memory_data(
@@ -341,7 +430,7 @@ def estimate_inference_memory(exp_hw_config, exp_model_config, **kwargs):
             d_model=hidden_dim,
             num_heads=num_heads,
             kv_heads=kv_heads,
-            intermediate_size=intermediate_size,
+            intermediate_size=tc.moe_intermediate_size if tc.use_moe else intermediate_size,
             vocab_size=vocab_size,
             model_type=tc.model_type,
         )
@@ -353,6 +442,9 @@ def estimate_inference_memory(exp_hw_config, exp_model_config, **kwargs):
             decode_transformer_graph,
             decode_transformer_forward_root,
             decode_transformer_backward_root,
+            decode_moe_transformer_graph,
+            decode_moe_transformer_forward_root,
+            decode_moe_transformer_backward_root,
             decode_interconnect_params,
         ), _ = tc.prepare_decode_graphs(
             batch_size=batch_size,
@@ -367,6 +459,9 @@ def estimate_inference_memory(exp_hw_config, exp_model_config, **kwargs):
             transformer_graph=decode_transformer_graph,
             transformer_forward_root=decode_transformer_forward_root,
             transformer_backward_root=decode_transformer_backward_root,
+            moe_transformer_graph=decode_moe_transformer_graph,
+            moe_transformer_forward_root=decode_moe_transformer_forward_root,
+            moe_transformer_backward_root=decode_moe_transformer_backward_root,
         )
         decode_root = decode_dispatcher.build_flattened_root_for_memory()
         decode_memory_data = mem_estimator.build_memory_data(
@@ -441,16 +536,20 @@ def autoregressive_decoder_gemm(self, batch_size, current_seq_len, d_model, num_
     Returns:
         OrderedDict: GEMM shapes [M, K, N] for decode step operations
     """
-    assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
     assert num_heads % kv_heads == 0, "num_heads must be divisible by kv_heads"
-    head_dim = d_model // num_heads
+    head_dim, q_size, kv_size = attention_dim_sizes(
+        d_model,
+        num_heads,
+        kv_heads,
+        head_dim=getattr(self, "head_dim", None),
+    )
     shared_heads = num_heads // kv_heads
     gemms = OrderedDict()
 
     # Decode-specific GEMM shapes with KV-cache handling (always enabled)
 
     # QKV Projection: Only the new token (seq_len = 1)
-    gemms["qkv_proj"] = (batch_size, 1, d_model, (2 * kv_heads + num_heads) * head_dim)
+    gemms["qkv_proj"] = (batch_size, 1, d_model, q_size + 2 * kv_size)
 
     # Attention Score: Q(new) @ K(cached+new)
     gemms["attention_score"] = (
@@ -471,19 +570,19 @@ def autoregressive_decoder_gemm(self, batch_size, current_seq_len, d_model, num_
     # === POST-ATTENTION LAYERS (same regardless of cache) ===
 
     # Output projection & FFNs only process the new token
-    gemms["output_proj"] = (batch_size, 1, d_model, d_model)
-    projected_dim = 2 * intermediate_size if str(model_type).lower() == "llama" else intermediate_size
+    gemms["output_proj"] = (batch_size, 1, q_size, d_model)
+    projected_dim = 2 * intermediate_size if is_llama_style(model_type) else intermediate_size
     if self.use_moe:
-        # assuming equal load balancing here
-        num_experts = max(1, int(getattr(self, "num_experts", getattr(self, "moe_num_experts", 1))))
-        top_k = max(1, int(getattr(self, "top_k", getattr(self, "moe_top_k", 1))))
-        effective_batch_size = math.ceil(batch_size * top_k / num_experts)
-
-        gemms["ffn1"] = (effective_batch_size , 1, d_model, projected_dim ) #gemm shape per expert
-        gemms["ffn2"] = (effective_batch_size , 1, intermediate_size, d_model)
+        moe_intermediate = int(getattr(self, "moe_intermediate_size", intermediate_size))
+        projected_dim = 2 * moe_intermediate if is_llama_style(model_type) else moe_intermediate
+        # MoE GEMM shapes use token-owner dimensions; dispatch/combine modeled separately.
+        gemms["ffn1"] = (batch_size, 1, d_model, projected_dim)
+        gemms["ffn2"] = (batch_size, 1, moe_intermediate, d_model)
     else:
         gemms["ffn1"] = (batch_size, 1, d_model, projected_dim) 
         gemms["ffn2"] = (batch_size, 1, intermediate_size, d_model)
+    gemms["linear"] = (batch_size, 1, d_model, vocab_size)
+    gemms["router"] = (batch_size, 1, d_model, getattr(self, "moe_num_experts", 1))
 
     return gemms
 

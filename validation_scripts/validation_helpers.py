@@ -1,3 +1,18 @@
+# Copyright 2026 NanoCad lab, UCLA
+# https://nanocad.ee.ucla.edu/
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import copy
@@ -8,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -22,6 +38,8 @@ if PROJECT_ROOT not in sys.path:
 from tools.parallelism_sweep import set_astrasim_cache_mode  # type: ignore
 
 VALIDATION_WORKERS_ENV = "RAPID_VALIDATION_WORKERS"
+VALIDATION_QUIET_ENV = "RAPID_VALIDATION_QUIET"
+VALIDATION_KEEP_TMP_ENV = "RAPID_VALIDATION_KEEP_TMP"
 DEFAULT_WORKER_COUNT = 8
 
 ResultParser = Callable[[str, "ValidationSpec"], Dict[str, Any]]
@@ -102,6 +120,62 @@ def _merge_list_of_dicts(orig: List[Dict[str, Any]],
       result.append(orig_index[id])
   return result
 
+
+def _summarize_network_config(hw_config_path: str) -> str:
+  try:
+    with open(hw_config_path, "r") as handle:
+      data = yaml.safe_load(handle)
+  except Exception as exc:
+    return f"[validation] Failed to read hardware config {hw_config_path}: {exc}"
+  if not isinstance(data, dict):
+    return f"[validation] Hardware config {hw_config_path} is not a mapping."
+  network = data.get("network", {})
+  dims = network.get("dimensions")
+  if not isinstance(dims, list):
+    return f"[validation] Hardware config {hw_config_path} has no network dimensions."
+  lines = [f"[validation] Network summary ({hw_config_path}):"]
+  for dim in dims:
+    if not isinstance(dim, dict):
+      continue
+    label = dim.get("label") or dim.get("id", "<unnamed>")
+    size = dim.get("size")
+    topo = dim.get("topology", {})
+    topo_type = topo.get("type")
+    bandwidth = topo.get("bandwidth")
+    latency = topo.get("latency")
+    parallelisms = dim.get("parallelisms", [])
+    lines.append(
+      f"  {label}: size={size}, topo={topo_type}, bw={bandwidth}, lat={latency}, axes={parallelisms}"
+    )
+  return "\n".join(lines)
+
+
+def _find_network_config(search_roots: Sequence[Path]) -> Optional[Path]:
+  candidates: List[Path] = []
+  for root in search_roots:
+    if not root.exists():
+      continue
+    candidates.extend(root.rglob("network_analytical_*.yml"))
+  if not candidates:
+    return None
+  return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def _log_astrasim_artifacts(tmp_dir: str, env: Mapping[str, str]) -> None:
+  roots = [Path(tmp_dir)]
+  astra_cache = env.get("ASTRA_CACHE_DIR")
+  if astra_cache:
+    roots.append(Path(astra_cache))
+  roots.append(Path(tmp_dir) / "output")
+  roots.append(Path(PROJECT_ROOT) / "output")
+  path = _find_network_config(roots)
+  if path is None:
+    return
+  work_dir = path.parent
+  cache_desc = f" (ASTRA_CACHE_DIR={astra_cache})" if astra_cache else ""
+  print(f"[validation] AstraSim artifacts: work_dir={work_dir}{cache_desc}")
+  print(f"[validation] AstraSim network config: {path}")
+
 def _deep_update(target: Dict[str, Any], overrides: Mapping[str, Any]) -> Dict[str, Any]:
   for key, value in overrides.items():
     if isinstance(value, Mapping):
@@ -150,37 +224,45 @@ def _prepare_config(
 
 
 def _read_env_worker_setting() -> Tuple[int, str]:
+  quiet = str(os.environ.get(VALIDATION_QUIET_ENV, "")).lower() in {"1", "true", "yes"}
   env_raw = os.environ.get(VALIDATION_WORKERS_ENV)
   if env_raw is None:
     return DEFAULT_WORKER_COUNT, f"{VALIDATION_WORKERS_ENV} unset (default {DEFAULT_WORKER_COUNT})"
   try:
     value = int(env_raw)
   except (TypeError, ValueError):
-    print(f"[validation] WARNING: {VALIDATION_WORKERS_ENV} must be a positive integer (got {env_raw!r}); using default {DEFAULT_WORKER_COUNT}.")
+    if not quiet:
+      print(f"[validation] WARNING: {VALIDATION_WORKERS_ENV} must be a positive integer (got {env_raw!r}); using default {DEFAULT_WORKER_COUNT}.")
     return DEFAULT_WORKER_COUNT, f"{VALIDATION_WORKERS_ENV} invalid ({env_raw!r}) -> default {DEFAULT_WORKER_COUNT}"
   if value <= 0:
-    print(f"[validation] WARNING: {VALIDATION_WORKERS_ENV} must be > 0 (got {env_raw!r}); using default {DEFAULT_WORKER_COUNT}.")
+    if not quiet:
+      print(f"[validation] WARNING: {VALIDATION_WORKERS_ENV} must be > 0 (got {env_raw!r}); using default {DEFAULT_WORKER_COUNT}.")
     return DEFAULT_WORKER_COUNT, f"{VALIDATION_WORKERS_ENV} <= 0 ({env_raw!r}) -> default {DEFAULT_WORKER_COUNT}"
   return value, f"{VALIDATION_WORKERS_ENV}={value}"
 
 
 def _determine_worker_count(spec_count: int, explicit_max: Optional[int]) -> int:
+  quiet = str(os.environ.get(VALIDATION_QUIET_ENV, "")).lower() in {"1", "true", "yes"}
   env_workers, env_desc = _read_env_worker_setting()
   requested = explicit_max if explicit_max is not None else env_workers
   request_desc = f"max_workers={explicit_max}" if explicit_max is not None else env_desc
   if requested <= 0:
-    print(f"[validation] WARNING: requested worker budget {requested} is not positive; bumping to 1.")
+    if not quiet:
+      print(f"[validation] WARNING: requested worker budget {requested} is not positive; bumping to 1.")
     requested = 1
   cpu_limit = max(1, os.cpu_count() or 1)
   if explicit_max is None and requested > cpu_limit:
-    print(f"[validation] WARNING: {VALIDATION_WORKERS_ENV} requested {requested} worker(s) but only {cpu_limit} CPU core(s) detected. Capping to {cpu_limit}.")
+    if not quiet:
+      print(f"[validation] WARNING: {VALIDATION_WORKERS_ENV} requested {requested} worker(s) but only {cpu_limit} CPU core(s) detected. Capping to {cpu_limit}.")
     requested = cpu_limit
   elif explicit_max is not None and requested > cpu_limit:
-    print(f"[validation] WARNING: max_workers requested {requested} worker(s) but only {cpu_limit} CPU core(s) detected. Capping to {cpu_limit}.")
+    if not quiet:
+      print(f"[validation] WARNING: max_workers requested {requested} worker(s) but only {cpu_limit} CPU core(s) detected. Capping to {cpu_limit}.")
     requested = cpu_limit
   worker_count = max(1, min(spec_count, requested))
-  print(f"[validation] Using {worker_count} worker(s) for {spec_count} experiment(s) "
-        f"(requested {request_desc}, cpu_limit={cpu_limit}).")
+  if not quiet:
+    print(f"[validation] Using {worker_count} worker(s) for {spec_count} experiment(s) "
+          f"(requested {request_desc}, cpu_limit={cpu_limit}).")
   return worker_count
 
 
@@ -237,7 +319,12 @@ def _execute_spec(spec: ValidationSpec) -> ValidationResult:
     )
     duration = time.time() - start_time
     output = proc.stdout or ""
+    _log_astrasim_artifacts(tmp_dir, env)
     if proc.returncode != 0:
+      if "Assertion `0 <= dest && dest < devices_count' failed" in output:
+        summary = _summarize_network_config(hardware_config_path)
+        output = f"{output}\n\n{summary}"
+        print(summary)
       return ValidationResult(
         spec=spec,
         success=False,
@@ -275,7 +362,11 @@ def _execute_spec(spec: ValidationSpec) -> ValidationResult:
       hardware_config_used=hardware_config_path,
     )
   finally:
-    shutil.rmtree(tmp_dir, ignore_errors=True)
+    keep_tmp = str(os.environ.get(VALIDATION_KEEP_TMP_ENV, "")).lower() in {"1", "true", "yes"}
+    if keep_tmp:
+      print(f"[validation] Keeping temp dir: {tmp_dir}")
+    else:
+      shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def run_validation_suite(
@@ -370,8 +461,14 @@ _DECODE_TIME_REGEX = re.compile(
 _INF_TIME_REGEX = re.compile(
   r"LLM inference time:\s*([0-9]+(?:\.[0-9]+)?)s"
 )
+_TTFT_REGEX = re.compile(
+  r"LLM time to first token:\s*([0-9]+(?:\.[0-9]+)?)s"
+)
+_TPOT_REGEX = re.compile(
+  r"midpoint=([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)s"
+)
 _TRAIN_TIME_REGEX = re.compile(
-  r"Training time for batch:\s*([0-9]+(?:\.[0-9]+)?)s"
+  r"(?:Training time for batch|LLM inference time):\s*([0-9]+(?:\.[0-9]+)?)s"
 )
 
 def parse_decode_time(output: str, spec: ValidationSpec) -> Dict[str, Any]:
@@ -386,6 +483,17 @@ def parse_inference_time(output: str, spec: ValidationSpec) -> Dict[str, Any]:
     raise ValueError(f"Failed to parse inference time for experiment '{spec.label}'.")
   return {"inference_time_s": float(match.group(1))}
 
+def parse_ttft(output: str, spec: ValidationSpec) -> Dict[str, Any]:
+  match = _TTFT_REGEX.search(output)
+  if not match:
+    raise ValueError(f"Failed to parse time-to-first-token for experiment '{spec.label}'.")
+  return {"ttft_s": float(match.group(1))}
+
+def parse_tpot(output: str, spec: ValidationSpec) -> Dict[str, Any]:
+  match = _TPOT_REGEX.search(output)
+  if not match:
+    raise ValueError(f"Failed to parse per-token output time for experiment '{spec.label}'.")
+  return {"tpot_s": float(match.group(1))}
 
 def parse_training_time(output: str, spec: ValidationSpec) -> Dict[str, Any]:
   match = _TRAIN_TIME_REGEX.search(output)
@@ -414,8 +522,27 @@ def record_validation(request):
   return _record
 
 
+def _collect_func_test_stats(terminalreporter):
+  prefix = "tests/test_func_test.py::test_func_test"
+  stats = terminalreporter.stats
+  passed = [rep for rep in stats.get("passed", []) if rep.nodeid.startswith(prefix)]
+  failed = [rep for rep in stats.get("failed", []) if rep.nodeid.startswith(prefix)]
+  skipped = [rep for rep in stats.get("skipped", []) if rep.nodeid.startswith(prefix)]
+  xfailed = [rep for rep in stats.get("xfailed", []) if rep.nodeid.startswith(prefix)]
+  xpassed = [rep for rep in stats.get("xpassed", []) if rep.nodeid.startswith(prefix)]
+  total = len(passed) + len(failed) + len(skipped) + len(xfailed) + len(xpassed)
+  if total == 0:
+    return None
+  return {
+    "total": total,
+    "passed": len(passed) + len(xpassed),
+    "xfailed": len(xfailed),
+  }
+
+
 def pytest_terminal_summary(terminalreporter, exitstatus):
-  if not _VALIDATION_METRICS:
+  func_stats = _collect_func_test_stats(terminalreporter)
+  if not _VALIDATION_METRICS and not func_stats:
     return
   tr = terminalreporter
   tr.write_sep("=", "Test results")
@@ -424,6 +551,10 @@ def pytest_terminal_summary(terminalreporter, exitstatus):
     if expected is not None:
       line += f" (expected <= {expected:.2f}%)"
     tr.write_line(line)
+  if func_stats:
+    tr.write_line(
+      f"{func_stats['passed']}/{func_stats['total']} functionality tests passed ({func_stats['xfailed']} xfailed)"
+    )
 
 __all__ = [
   "ValidationSpec",

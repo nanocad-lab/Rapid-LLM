@@ -1,5 +1,21 @@
+# Copyright 2026 NanoCad lab, UCLA
+# https://nanocad.ee.ucla.edu/
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from dataclasses import dataclass, field
 import math
+import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import yaml as _yaml
@@ -14,6 +30,17 @@ _PRECISION_DTYPE_BYTES = {
     "fp32": 4.0,
     "single": 4.0,
 }
+
+
+def _env_flag(name: str) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return False
+    normalized = value.strip().lower()
+    return normalized not in {"", "0", "false", "no"}
+
+
+_MOE_PADDING_WARNED = False
 
 
 @dataclass(frozen=True)
@@ -368,6 +395,10 @@ class NetworkDimensionLayout:
     parallelisms: Tuple[str, ...] = field(default_factory=tuple)
     energy_per_bit: float = 0.0
     optimize_2dmap: bool = False
+    superpod_variant: Optional[str] = None
+    superpod_leaf_size: Optional[int] = None
+    superpod_leaf_switches_per_su: Optional[int] = None
+    superpod_spine_switches_per_su: Optional[int] = None
 
     @classmethod
     def from_raw(
@@ -422,17 +453,55 @@ class NetworkDimensionLayout:
         if "type" not in topo_dict:
             raise ValueError(f"network dimension '{label}' topology missing required 'type'")
         topo_type = str(topo_dict["type"])
+        normalized_topo = topo_type.lower().replace("-", "").replace("_", "")
+        is_2d_topo = normalized_topo in {"mesh2d", "torus2d", "kingmesh2d", "fcring2d"}
+        is_superpod = normalized_topo == "superpod"
+
+        superpod_variant: Optional[str] = None
+        superpod_leaf_size: Optional[int] = None
+        superpod_leaf_switches_per_su: Optional[int] = None
+        superpod_spine_switches_per_su: Optional[int] = None
+
+        if is_superpod:
+            raw_variant = topo_dict.get("superpod_variant")
+            if raw_variant is None:
+                raise ValueError(
+                    f"network dimension '{label}' SuperPOD topology requires 'superpod_variant' set to 'h100'"
+                )
+            superpod_variant = str(raw_variant).strip().lower()
+            if superpod_variant != "h100":
+                raise ValueError(
+                    f"network dimension '{label}' SuperPOD superpod_variant must be 'h100' (got {raw_variant!r})"
+                )
+
+            def _parse_superpod_int(field: str, default: int) -> int:
+                raw_value = topo_dict.get(field, default)
+                if raw_value is None:
+                    return default
+                try:
+                    parsed = int(raw_value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"network dimension '{label}' SuperPOD {field} must be an integer"
+                    ) from exc
+                if parsed < 1:
+                    raise ValueError(
+                        f"network dimension '{label}' SuperPOD {field} must be > 0"
+                    )
+                return parsed
+
+            superpod_leaf_size = _parse_superpod_int("leaf_size", 32)
+            superpod_leaf_switches_per_su = _parse_superpod_int("leaf_switches_per_su", 8)
+            superpod_spine_switches_per_su = _parse_superpod_int("spine_switches_per_su", 4)
 
         if "bandwidth" not in topo_dict:
             raise ValueError(f"network dimension '{label}' topology missing required 'bandwidth'")
         bandwidth_raw = topo_dict["bandwidth"]
         bandwidth = parse_bandwidth_string(bandwidth_raw)
-        normalized_topo = topo_type.lower().replace("-", "").replace("_", "")
-        is_2d_topo = normalized_topo in {"mesh2d", "torus2d", "kingmesh2d", "fcring2d"}
         if isinstance(bandwidth, (list, tuple)):
-            if not is_2d_topo:
+            if not (is_2d_topo or is_superpod):
                 raise ValueError(
-                    f"network dimension '{label}' bandwidth tuple is only supported for 2D topologies"
+                    f"network dimension '{label}' bandwidth tuple is only supported for 2D topologies or SuperPOD"
                 )
             if len(bandwidth) != 2:
                 raise ValueError(
@@ -455,6 +524,10 @@ class NetworkDimensionLayout:
             if float(bandwidth) <= 0:
                 raise ValueError(
                     f"network dimension '{label}' bandwidth must be > 0"
+                )
+            if is_superpod:
+                raise ValueError(
+                    f"network dimension '{label}' SuperPOD bandwidth must be a two-entry list/tuple"
                 )
 
         try:
@@ -495,7 +568,6 @@ class NetworkDimensionLayout:
             )
         optimize_2dmap = bool(raw_optimize)
         if optimize_2dmap:
-            normalized_topo = topo_type.lower().replace("-", "").replace("_", "")
             if normalized_topo not in {"mesh2d", "torus2d", "kingmesh2d", "fcring2d"}:
                 raise ValueError(
                     f"network dimension '{label}' sets optimize_2dmap but topology type '{topo_type}'"
@@ -663,6 +735,34 @@ class NetworkDimensionLayout:
             expected_product=computed_product,
         )
 
+        if is_superpod:
+            total_boxes = int(size_value)
+            leaf_size = int(superpod_leaf_size or 0)
+            if leaf_size < 1:
+                raise ValueError(
+                    f"network dimension '{label}' SuperPOD leaf_size must be > 0"
+                )
+            if total_boxes % leaf_size != 0:
+                divisors: List[int] = []
+                root = int(math.isqrt(total_boxes)) if total_boxes >= 1 else 0
+                for candidate in range(1, root + 1):
+                    if total_boxes % candidate != 0:
+                        continue
+                    divisors.append(candidate)
+                    other = total_boxes // candidate
+                    if other != candidate:
+                        divisors.append(other)
+                divisors = sorted(divisors)
+                raise ValueError(
+                    f"network dimension '{label}' SuperPOD size mismatch: N_boxes={total_boxes} "
+                    f"is not divisible by leaf_size={leaf_size}. Suggested leaf_size divisors: {divisors}"
+                )
+            num_su = total_boxes // leaf_size
+            if num_su <= 1:
+                raise ValueError(
+                    f"network dimension '{label}' SuperPOD requires more than 1 SU (got {num_su})."
+                )
+
         return cls(
             id=dim_id,
             label=label,
@@ -676,6 +776,10 @@ class NetworkDimensionLayout:
             parallelisms=tuple(normalized_parallelisms),
             energy_per_bit=energy_per_bit,
             optimize_2dmap=optimize_2dmap,
+            superpod_variant=superpod_variant,
+            superpod_leaf_size=superpod_leaf_size,
+            superpod_leaf_switches_per_su=superpod_leaf_switches_per_su,
+            superpod_spine_switches_per_su=superpod_spine_switches_per_su,
         )
 
     @property
@@ -912,13 +1016,46 @@ def _build_network_layout_config(
 
 _PARALLELISM_DEFAULTS: Dict[str, object] = {
     "auto": False,
-    "dp": 1,
-    "lp": 1,
+    "pp": 1,
     "mb": 1,
     "tp": 1,
     "cp": 1,
     "tp_sp": False,
 }
+
+
+@dataclass
+class TrainParallelismConfig:
+    dp: int
+    ep: int
+    tp_ep: bool
+
+    @classmethod
+    def from_dict(cls, train_block: Optional[Dict[str, object]]) -> "TrainParallelismConfig":
+        train_block = _require_mapping("parallelism.train", train_block or {})
+        dp = _coerce_int(_require_field("parallelism.train", train_block, "dp"), "parallelism.train.dp")
+        ep = _coerce_int(_require_field("parallelism.train", train_block, "ep"), "parallelism.train.ep")
+        tp_ep = _coerce_bool(_require_field("parallelism.train", train_block, "tp_ep"), "parallelism.train.tp_ep")
+        return cls(dp=dp, ep=ep, tp_ep=tp_ep)
+
+
+@dataclass
+class InferenceParallelismConfig:
+    replica_count: int
+    moe_dp: int
+
+    @classmethod
+    def from_dict(cls, inference_block: Optional[Dict[str, object]]) -> "InferenceParallelismConfig":
+        inference_block = _require_mapping("parallelism.inference", inference_block or {})
+        replica_count = _coerce_int(
+            _require_field("parallelism.inference", inference_block, "replica_count"),
+            "parallelism.inference.replica_count",
+        )
+        moe_dp = _coerce_int(
+            _require_field("parallelism.inference", inference_block, "moe_dp"),
+            "parallelism.inference.moe_dp",
+        )
+        return cls(replica_count=replica_count, moe_dp=moe_dp)
 
 
 @dataclass
@@ -1039,6 +1176,7 @@ class LLMAttentionConfig:
     attention_type: str
     num_heads: int
     kv_heads: Optional[int] = None
+    head_dim: Optional[int] = None
     use_flashattention: bool = False
     attention_tile_size: Optional[int] = None
 
@@ -1056,6 +1194,18 @@ class LLMAttentionConfig:
             )
 
         num_heads = _parse_int_field("model_param.attention", attention_dict, "num_heads")
+        head_dim_raw = attention_dict.get("head_dim", None)
+        if head_dim_raw is not None:
+            try:
+                head_dim = int(head_dim_raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"model_param.attention.head_dim must be an integer when provided (got {head_dim_raw!r})"
+                ) from exc
+            if head_dim <= 0:
+                raise ValueError("model_param.attention.head_dim must be a positive integer")
+        else:
+            head_dim = None
         kv_heads_raw = attention_dict.get("kv_heads", None)
         if attn_type == "gqa":
             if kv_heads_raw is None:
@@ -1110,8 +1260,81 @@ class LLMAttentionConfig:
             attention_type=attn_type,
             num_heads=num_heads,
             kv_heads=kv_heads,
+            head_dim=head_dim,
             use_flashattention=use_flashattention,
             attention_tile_size=attention_tile_size,
+        )
+
+
+@dataclass
+class MoEConfig:
+    num_experts: int
+    top_k: int
+    moe_intermediate_size: int
+    n_shared_experts: int
+    moe_layer_freq: int
+    first_k_dense_replace: int
+
+    @classmethod
+    def from_dict(
+        cls,
+        moe_dict: Dict[str, object],
+        *,
+        validate: bool = True,
+        fallback_intermediate_size: Optional[int] = None,
+    ) -> "MoEConfig":
+        moe_dict = _require_mapping("model_param.moe", moe_dict)
+        if not validate:
+            def _lenient_int(value: object, default: int) -> int:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return default
+
+            if fallback_intermediate_size is None:
+                fallback_intermediate_size = 1
+            fallback_intermediate_size = _lenient_int(fallback_intermediate_size, 1)
+
+            num_experts = _lenient_int(moe_dict.get("num_experts", 1), 1)
+            top_k = _lenient_int(moe_dict.get("top_k", 1), 1)
+            moe_intermediate_size = _lenient_int(
+                moe_dict.get("moe_intermediate_size", fallback_intermediate_size),
+                fallback_intermediate_size,
+            )
+            n_shared_experts = _lenient_int(moe_dict.get("n_shared_experts", 0), 0)
+            moe_layer_freq = _lenient_int(moe_dict.get("moe_layer_freq", 1), 1)
+            first_k_dense_replace = _lenient_int(moe_dict.get("first_k_dense_replace", 0), 0)
+        else:
+            num_experts = _parse_int_field("model_param.moe", moe_dict, "num_experts")
+            top_k = _parse_int_field("model_param.moe", moe_dict, "top_k")
+            moe_intermediate_size = _parse_int_field("model_param.moe", moe_dict, "moe_intermediate_size")
+            n_shared_experts = _coerce_int(
+                moe_dict.get("n_shared_experts", 0),
+                "model_param.moe.n_shared_experts",
+                min_value=0,
+            )
+            moe_layer_freq = _coerce_int(
+                moe_dict.get("moe_layer_freq", 1),
+                "model_param.moe.moe_layer_freq",
+                min_value=1,
+            )
+            first_k_dense_replace = _coerce_int(
+                moe_dict.get("first_k_dense_replace", 0),
+                "model_param.moe.first_k_dense_replace",
+                min_value=0,
+            )
+
+            if top_k > num_experts:
+                raise ValueError("model_param.moe.top_k cannot exceed model_param.moe.num_experts")
+
+        # TODO: Shared experts are modeled as replicated across EP for now.
+        return cls(
+            num_experts=num_experts,
+            top_k=top_k,
+            moe_intermediate_size=moe_intermediate_size,
+            n_shared_experts=n_shared_experts,
+            moe_layer_freq=moe_layer_freq,
+            first_k_dense_replace=first_k_dense_replace,
         )
 
 
@@ -1131,12 +1354,17 @@ class LLMConfig:
     vocab_size: int
     n_tokens: int
     attention: LLMAttentionConfig
-    num_experts: int
-    top_k: int
+    moe: MoEConfig
 
     @property
     def num_heads(self) -> int:
         return self.attention.num_heads
+
+    @property
+    def head_dim(self) -> int:
+        if getattr(self.attention, "head_dim", None) is not None:
+            return int(self.attention.head_dim)
+        return self.hidden_dim // self.num_heads
 
     @property
     def use_flashattention(self) -> bool:
@@ -1144,7 +1372,54 @@ class LLMConfig:
 
     @property
     def use_moe(self) -> bool:
-        return self.num_experts > 1
+        return self.num_experts > 1 and self.num_moe_layers > 0
+
+    @property
+    def num_experts(self) -> int:
+        return self.moe.num_experts
+
+    @property
+    def top_k(self) -> int:
+        return self.moe.top_k
+
+    @property
+    def num_moe_layers(self) -> int:
+        return sum(self.moe_layer_mask)
+
+    @property
+    def n_shared_experts(self) -> int:
+        return self.moe.n_shared_experts
+
+    @property
+    def moe_intermediate_size(self) -> int:
+        return self.moe.moe_intermediate_size
+
+    @property
+    def moe_layer_freq(self) -> int:
+        return self.moe.moe_layer_freq
+
+    @property
+    def first_k_dense_replace(self) -> int:
+        return self.moe.first_k_dense_replace
+
+    @property
+    def moe_params_enabled(self) -> bool:
+        return self.num_experts > 1 and self.num_moe_layers > 0
+
+    @property
+    def moe_layer_mask(self) -> List[bool]:
+        if self.num_experts <= 1:
+            return [False for _ in range(self.num_layers)]
+        mask: List[bool] = []
+        for layer_idx in range(self.num_layers):
+            if layer_idx < self.first_k_dense_replace:
+                mask.append(False)
+                continue
+            if self.moe_layer_freq <= 0:
+                mask.append(False)
+                continue
+            mask.append(((layer_idx - self.first_k_dense_replace) % self.moe_layer_freq) == 0)
+        return mask
 
 
     @property
@@ -1175,21 +1450,15 @@ class LLMConfig:
 
         model_type_raw = _parse_str_field("model_param", model_dict, "model_type")
         model_type = model_type_raw.strip().lower()
-        if model_type not in {"gpt", "llama"}:
+        if model_type in {"glm4", "glm"}:
+            model_type = "glm4_moe"
+        if model_type not in {"gpt", "llama", "glm4_moe"}:
             raise ValueError(
-                f"model_param.model_type must be either 'gpt' or 'llama' (got {model_type_raw!r})"
+                "model_param.model_type must be either 'gpt', 'llama', or 'glm4_moe' "
+                f"(got {model_type_raw!r})"
             )
 
         attention = LLMAttentionConfig.from_dict(_require_field("model_param", model_dict, "attention"))
-
-        num_experts = _parse_int_field("model_param", model_dict, "num_experts")
-        top_k_raw = model_dict.get("top_k", 1)
-        try:
-            top_k = int(top_k_raw)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"model_param.top_k must be an integer (got {top_k_raw!r})") from exc
-        if top_k <= 0:
-            raise ValueError("model_param.top_k must be a positive integer")
 
         num_layers = _parse_int_field("model_param", model_dict, "num_layers")
         hidden_dim = _parse_int_field("model_param", model_dict, "hidden_dim")
@@ -1212,6 +1481,30 @@ class LLMConfig:
         vocab_size = _parse_int_field("model_param", model_dict, "vocab_size")
         intermediate_size = _parse_int_field("model_param", model_dict, "intermediate_size")
 
+        if model_type == "glm4_moe":
+            if attention.head_dim is None:
+                raise ValueError(
+                    "model_param.attention.head_dim must be specified when model_type is 'glm4_moe'"
+                )
+        elif attention.head_dim is not None:
+            if hidden_dim % attention.num_heads != 0:
+                raise ValueError(
+                    "model_param.hidden_dim must be divisible by attention.num_heads when "
+                    "model_param.attention.head_dim is provided for non-GLM models"
+                )
+            expected_head_dim = hidden_dim // attention.num_heads
+            if attention.head_dim != expected_head_dim:
+                raise ValueError(
+                    "model_param.attention.head_dim must match hidden_dim/num_heads for non-GLM models "
+                    f"(expected {expected_head_dim}, got {attention.head_dim})"
+                )
+        else:
+            if hidden_dim % attention.num_heads != 0:
+                raise ValueError(
+                    "model_param.hidden_dim must be divisible by attention.num_heads when "
+                    "model_param.attention.head_dim is not provided"
+                )
+
         decode_len = model_dict.get("decode_len", None)
         if decode_len is not None:
             try:
@@ -1223,6 +1516,44 @@ class LLMConfig:
 
         if run_type == "inference" and decode_len is None:
             raise ValueError("model_param.decode_len must be specified when run_type is 'inference'")
+
+        moe_block = model_dict.get("moe", {})
+        if moe_block is None:
+            moe_block = {}
+        moe_candidate = MoEConfig.from_dict(
+            moe_block,
+            validate=False,
+            fallback_intermediate_size=intermediate_size,
+        )
+
+        def _count_moe_layers(
+            *,
+            num_layers: int,
+            moe_layer_freq: int,
+            first_k_dense_replace: int,
+        ) -> int:
+            count = 0
+            for layer_idx in range(num_layers):
+                if layer_idx < first_k_dense_replace:
+                    continue
+                if moe_layer_freq <= 0:
+                    continue
+                if ((layer_idx - first_k_dense_replace) % moe_layer_freq) == 0:
+                    count += 1
+            return count
+
+        moe_enabled = (
+            moe_candidate.num_experts > 1
+            and _count_moe_layers(
+                num_layers=num_layers,
+                moe_layer_freq=moe_candidate.moe_layer_freq,
+                first_k_dense_replace=moe_candidate.first_k_dense_replace,
+            )
+            > 0
+        )
+        moe = moe_candidate
+        if moe_enabled:
+            moe = MoEConfig.from_dict(moe_block)
 
         return cls(
             mode=mode,
@@ -1239,8 +1570,7 @@ class LLMConfig:
             vocab_size=vocab_size,
             n_tokens=0,
             attention=attention,
-            num_experts=num_experts,
-            top_k=top_k,
+            moe=moe,
         )
 
 
@@ -1333,12 +1663,13 @@ class SWConfig:
 @dataclass
 class SchedulingConfig:
     auto: bool
-    dp: int
-    lp: int
+    pp: int
     mb: int
     tp: int
     cp: int
     tp_sp: bool
+    train: TrainParallelismConfig
+    inference: InferenceParallelismConfig
 
     @classmethod
     def from_dict(cls, parallelism_block: Optional[Dict[str, object]]) -> "SchedulingConfig":
@@ -1349,19 +1680,23 @@ class SchedulingConfig:
         params.update(parallelism_block)
         auto = _coerce_bool(params.get("auto", False), "parallelism.auto")
         tp_sp = _coerce_bool(params.get("tp_sp", False), "parallelism.tp_sp")
-        dp = _coerce_int(params.get("dp", 1), "parallelism.dp")
-        lp = _coerce_int(params.get("lp", 1), "parallelism.lp")
+        pp = _coerce_int(params.get("pp", 1), "parallelism.pp")
         mb = _coerce_int(params.get("mb", 1), "parallelism.mb")
         tp = _coerce_int(params.get("tp", 1), "parallelism.tp")
         cp = _coerce_int(params.get("cp", 1), "parallelism.cp")
+        train_cfg = TrainParallelismConfig.from_dict(_require_field("parallelism", parallelism_block, "train"))
+        inference_cfg = InferenceParallelismConfig.from_dict(
+            _require_field("parallelism", parallelism_block, "inference")
+        )
         return cls(
             auto=auto,
-            dp=dp,
-            lp=lp,
+            pp=pp,
             mb=mb,
             tp=tp,
             cp=cp,
             tp_sp=tp_sp,
+            train=train_cfg,
+            inference=inference_cfg,
         )
 
 
@@ -1498,8 +1833,9 @@ class HWConfig:
         sch_config = SchedulingConfig.from_dict(config_dict.get("parallelism", {}))
         scheduling_for_network = {
             "auto": sch_config.auto,
-            "dp": sch_config.dp,
-            "lp": sch_config.lp,
+            "dp": sch_config.train.dp,
+            "ep": sch_config.train.ep,
+            "pp": sch_config.pp,
             "mb": sch_config.mb,
             "tp": sch_config.tp,
             "cp": sch_config.cp,
@@ -1684,7 +2020,7 @@ def parse_config(filename, config_type):
         except _YAMLError as exc:
             hint = (
                 f"Failed to parse YAML config '{filename}'. "
-                "Please check indentation and required sections like 'attention' and parameters such as 'num_experts'."
+                "Please check indentation and required sections like 'attention' and parameters such as 'moe.num_experts'."
             )
             raise ValueError(hint) from exc
         # print(config_dict)
@@ -1742,11 +2078,12 @@ def validate_model_config(hw_config: HWConfig, model_config: ModelConfig) -> Non
     if sch is None:
         raise ValueError("hardware parallelism settings are missing")
 
-    dp = sch.dp
-    lp = sch.lp
+    pp = sch.pp
     mb = sch.mb
     tp = sch.tp
     cp = sch.cp
+    train_dp = sch.train.dp
+    train_ep = sch.train.ep
 
     model = model_config.model_config
 
@@ -1761,10 +2098,13 @@ def validate_model_config(hw_config: HWConfig, model_config: ModelConfig) -> Non
     if not isinstance(model, LLMConfig):
         raise ValueError("Unsupported model config type for validation")
 
-    if model.num_experts > 1 and model.top_k > model.num_experts:
-        raise ValueError("model_param.top_k cannot exceed model_param.num_experts")
+    if model.use_moe and model.top_k > model.num_experts:
+        raise ValueError("model_param.moe.top_k cannot exceed model_param.moe.num_experts")
 
-    if model.run_type == "inference":
+    run_type = str(getattr(model, "run_type", "training")).lower()
+    if run_type == "inference":
+        replica_count = sch.inference.replica_count
+        moe_dp = sch.inference.moe_dp
         if cp > 1:
             raise ValueError(
                 "Context parallelism (cp) is not supported for LLM inference. "
@@ -1775,13 +2115,23 @@ def validate_model_config(hw_config: HWConfig, model_config: ModelConfig) -> Non
                 f"[WARNING]: LLM inference configured with mb={mb} (>1). \n "
                 "Pipeline micro-batching is ill-defined for autoregressive decode and should be avoided."
             )
-        if getattr(hw_config.sw_config, "dp_zero_stage", 0) >= 3 and dp > 1:
+        if getattr(hw_config.sw_config, "dp_zero_stage", 0) >= 3 and replica_count > 1:
             raise ValueError(
                 "ZeRO-3 data parallelism is not supported for inference runs "
-                "(dp_zero_stage must be <3 or dp=1)."
+                "(dp_zero_stage must be <3 or replica_count=1)."
+            )
+        if not model.use_moe and moe_dp > 1:
+            raise ValueError(
+                "parallelism.inference.moe_dp must be 1 when MoE is disabled."
             )
         if model.decode_len is not None and model.decode_len > model.seq_len:
             raise ValueError("model_param.decode_len must be <= seq_len for inference")
+    else:
+        if cp > 1 and train_ep > 1:
+            raise ValueError(
+                "Unsupported parallelism combination: cp > 1 with ep > 1 is not allowed. "
+                "Set parallelism.cp=1 or parallelism.train.ep=1."
+            )
 
     if (
         model.gradient_accumulation_steps > 1
@@ -1797,22 +2147,105 @@ def validate_model_config(hw_config: HWConfig, model_config: ModelConfig) -> Non
         raise ValueError(
             "Global batch size must be divisible by gradient accumulation steps"
         )
-    batch_size = model.global_batch_size // model.gradient_accumulation_steps
-    if batch_size % dp != 0:
-        raise ValueError("Batch size must be divisible by data parallelism degree")
-    mini_batch = batch_size // dp
-    if mini_batch % mb != 0:
-        raise ValueError("Batch size must be divisible by micro-batch size")
+    if run_type != "inference":
+        batch_size = model.global_batch_size // model.gradient_accumulation_steps
+        dp_dense = train_dp * train_ep if model.use_moe else train_dp
+        if batch_size % dp_dense != 0:
+            if model.use_moe:
+                raise ValueError(f"Batch size must be divisible by dp*ep when MoE is enabled: {batch_size} % {dp_dense} != 0")
+            raise ValueError(f"Batch size must be divisible by data parallelism degree: {batch_size} % {train_dp} != 0")
+        mini_batch = batch_size // dp_dense
+        if mini_batch % mb != 0:
+            raise ValueError(f"Batch size must be divisible by micro-batch size: {mini_batch} % {mb} != 0")
 
-    if model.num_experts > 1:
-        moe_ranks = max(1, tp * cp)
-        if moe_ranks > model.num_experts:
+        if not model.use_moe and train_ep > 1:
             raise ValueError(
-                "Number of MoE experts must be at least equal to the number of parallel ranks."
+                "parallelism.train.ep must be 1 when MoE is disabled. "
+                "Set parallelism.train.ep=1 or enable MoE."
             )
-        if model.num_experts % moe_ranks != 0:
+
+    if model.use_moe:
+        allow_moe_padding = _env_flag("RAPID_ALLOW_MOE_EXPERT_PADDING")
+        if run_type == "inference":
+            moe_ranks = tp * max(1, moe_dp)
+            if moe_ranks > model.num_experts:
+                raise ValueError(
+                    "MoE routing group size cannot exceed the number of MoE experts "
+                    f"(moe_group={moe_ranks}, tp={tp}, moe_dp={moe_dp})."
+                )
+            if model.num_experts % moe_ranks != 0:
+                if allow_moe_padding:
+                    global _MOE_PADDING_WARNED
+                    if not _MOE_PADDING_WARNED:
+                        print(
+                            "[WARNING]: MoE expert count is not divisible by tp*moe_dp for "
+                            "inference; padding experts to enable simulation. "
+                            "Set RAPID_ALLOW_MOE_EXPERT_PADDING=0 to enforce divisibility."
+                        )
+                        _MOE_PADDING_WARNED = True
+                else:
+                    raise ValueError(
+                        "Number of MoE experts must be divisible by the MoE routing group size "
+                        f"(moe_group={moe_ranks}, tp={tp}, moe_dp={moe_dp})."
+                    )
+        else:
+            tp_sp = bool(getattr(sch, "tp_sp", False))
+            if tp > 1 and train_ep > 1 and not tp_sp:
+                raise ValueError(
+                    "MoE with tp>1 and ep>1 requires sequence parallelism. "
+                    "Set parallelism.tp_sp=true."
+                )
+            moe_ranks = train_ep
+            if moe_ranks > model.num_experts:
+                raise ValueError(
+                    "MoE routing group size cannot exceed the number of MoE experts "
+                    f"(moe_group={moe_ranks}, tp={tp}, ep={train_ep})."
+                )
+            if model.num_experts % moe_ranks != 0:
+                raise ValueError(
+                    "Number of MoE experts must be divisible by the MoE routing group size "
+                    f"(moe_group={moe_ranks}, tp={tp}, ep={train_ep})."
+                )
+            effective_batch = mini_batch
+            if pp > 1:
+                effective_batch = mini_batch // mb
+            elif dp_dense <= 1:
+                effective_batch = batch_size
+            seq_per_rank = math.ceil(model.seq_len / max(1, cp))
+            tokens_owner = int(effective_batch) * int(seq_per_rank)
+            tokens_dispatched = tokens_owner * int(model.top_k)
+            if tokens_dispatched % moe_ranks != 0:
+                raise ValueError(
+                    "MoE routed tokens must divide evenly across the MoE routing group for batched expert GEMMs\n"
+                    f"(tokens_owner = effective_batch * seq_per_rank = {effective_batch} * {seq_per_rank})\n"
+                    f"(tokens_dispatched = tokens_owner * top_k = {tokens_owner} * {model.top_k})\n"
+                    f"(tokens_dispatched={tokens_dispatched} % moe_group={moe_ranks} != 0)"
+                )
+            tokens_local = tokens_dispatched // moe_ranks
+            experts_per_rank = model.num_experts // moe_ranks
+            if tokens_local % experts_per_rank != 0:
+                raise ValueError(
+                    "MoE routed tokens per rank must divide evenly across experts for batched expert GEMMs\n"
+                    f"(tokens_owner = effective_batch * seq_per_rank = {effective_batch} * {seq_per_rank})\n"
+                    f"(tokens_dispatched = tokens_owner * top_k = {tokens_owner} * {model.top_k})\n"
+                    f"(tokens_local = tokens_dispatched // moe_ranks = {tokens_dispatched} // {moe_ranks})\n"
+                    f"(tokens_local={tokens_local} % experts_per_rank={experts_per_rank} != 0)\n"
+                )
+        backend = getattr(hw_config, "execution_backend", None)
+        if backend and str(getattr(backend, "model", "")).lower() == "astra":
+            astra_cfg = getattr(backend, "astra", None)
+            astra_mode = str(getattr(astra_cfg, "mode", "")).lower() if astra_cfg else ""
+            if astra_mode == "full_astrasim_flattened":
+                raise NotImplementedError(
+                    "MoE is not supported with full AstraSim flattened execution."
+                )
+        if run_type != "inference" and getattr(hw_config.sw_config, "dp_zero_stage", 0) >= 2:
+            raise NotImplementedError("MoE with ZeRO-2/3 (dp_zero_stage >= 2) is not supported yet.")
+        network_layout = getattr(hw_config, "network_layout", None)
+        faulty_links = getattr(network_layout, "faulty_links", ()) if network_layout else ()
+        if faulty_links:
             raise ValueError(
-                "Number of MoE experts must be divisible by the total number of parallel ranks (tp * cp )."
+                "MoE with faulty links is not supported yet. Please disable faults or MoE."
             )
 
 

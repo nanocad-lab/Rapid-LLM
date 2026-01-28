@@ -188,7 +188,7 @@ memory_hierarchy:
 scheduling_param:
   auto: false
   dp: 1
-  lp: 1
+  pp: 1
   mb: 1
   tp: 20
   tp_sp: false

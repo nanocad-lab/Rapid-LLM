@@ -1,0 +1,6 @@
+model_name,tp,network_device,input_tokens,output_tokens,batch_size,ttft_ms,tpot_ms,e2e_s,vidur_output_dir
+meta-llama/Llama-2-70b-hf,2,a100_pairwise_nvlink,200,200,1,100.557,56.658,11.432071,/w/ee.00/puneet/nanoproj/users/yaoe888/vidur/simulator_output/meta-llama/Llama-2-70b-hf/in200_out200_b1_TP2/2026-01-10_15-19-50-590045
+meta-llama/Llama-2-70b-hf,8,a100_dgx,200,200,1,45.342,24.011,4.847562,/w/ee.00/puneet/nanoproj/users/yaoe888/vidur/simulator_output/meta-llama/Llama-2-70b-hf/in200_out200_b1_TP8/2026-01-10_15-19-19-233814
+meta-llama/Llama-2-7b-hf,2,a100_pairwise_nvlink,200,200,1,15.412,10.005,2.016321,/w/ee.00/puneet/nanoproj/users/yaoe888/vidur/simulator_output/meta-llama/Llama-2-7b-hf/in200_out200_b1_TP2/2026-01-10_15-30-30-535429
+meta-llama/Llama-2-7b-hf,8,a100_dgx,200,200,1,9.596,6.217,1.252989,/w/ee.00/puneet/nanoproj/users/yaoe888/vidur/simulator_output/meta-llama/Llama-2-7b-hf/in200_out200_b1_TP8/2026-01-10_15-30-30-535757
+meta-llama/Llama-2-7b-hf,1,a100_dgx,200,200,1,18.124,9.449,1.907914,/w/ee.00/puneet/nanoproj/users/yaoe888/vidur/simulator_output/meta-llama/Llama-2-7b-hf/in200_out200_b1_TP1/2026-01-10_15-31-08-801376

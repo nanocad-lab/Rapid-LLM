@@ -177,8 +177,8 @@ scheduling_param:
   auto: false
   ### LLM PARAMS ###
   dp: 1 # data parallelism. Acts as replica count during inference
-  lp: 1 # pipeline parallelism. Number of pipeline stages 
-  mb: 1 # micro-batches (for best results set to >= lp)
+  pp: 1 # pipeline parallelism. Number of pipeline stages 
+  mb: 1 # micro-batches (for best results set to >= pp)
   tp: 1 # tensor parallelism
   tp_sp: true # tensor-sequence parallelism
   cp: 1  # context parallelism

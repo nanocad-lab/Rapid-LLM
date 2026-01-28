@@ -1,0 +1,8 @@
+device,model,batch,mb,dp,tp,pp,cp,tp_sp,recomputation,actual_time_s
+A100_korthi,GPT 1T,512,512,1,8,64,1,False,full,87.9
+A100_korthi,GPT 1T,512,512,1,8,64,1,True,selective,69.1
+A100_selene,GPT 1T,3072,512,6,8,64,1,False,full,100.7
+A100_selene,GPT 310B,2160,144,15,8,16,1,False,full,34.1
+A100_selene,GPT 530B,2520,280,9,8,35,1,False,full,51.2
+A100_korthi,GPT 175B,64,64,1,8,8,1,False,full,16.9
+A100_korthi,GPT 175B,64,64,1,8,8,1,True,selective,12.9

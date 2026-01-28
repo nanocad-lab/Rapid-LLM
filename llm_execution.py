@@ -1,3 +1,18 @@
+# Copyright 2026 NanoCad lab, UCLA
+# https://nanocad.ee.ucla.edu/
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import math
@@ -328,6 +343,7 @@ class PipelineGraphFlattener:
         pipeline_graph: Graph,
         transformer_graph: Graph,
         *,
+        moe_transformer_graph: Optional[Graph] = None,
         rank_layout: Optional[Dict[str, Any]] = None,
     ) -> None:
         if transformer_graph is None:
@@ -340,8 +356,17 @@ class PipelineGraphFlattener:
 
         self.pipeline_graph = pipeline_graph
         self.transformer_graph = transformer_graph
+        self.moe_transformer_graph = moe_transformer_graph
         self._gemm_entries = list(gemm_entries)
-        par_degree = transformer_graph.tp * transformer_graph.cp
+        self._gemm_entries_moe: Optional[List[Dict[str, Any]]] = None
+        if moe_transformer_graph is not None:
+            moe_cfg = getattr(moe_transformer_graph, "transformer_cfg", None) or {}
+            moe_entries = moe_cfg.get("gemms")
+            if not moe_entries:
+                raise ValueError("MoE transformer GEMM template is missing")
+            self._gemm_entries_moe = list(moe_entries)
+        ep_size = int(getattr(transformer_graph, "ep", 1))
+        par_degree = transformer_graph.tp * transformer_graph.cp * ep_size
         self._par_degree = max(1, int(par_degree))
         self._zero_stage = int(getattr(transformer_graph, "misc_metadata", {}).get("dp_zero_stage", 0))
         self._layout_axis_order: Optional[List[str]] = None
@@ -349,7 +374,8 @@ class PipelineGraphFlattener:
         self._layout_axis_strides: Dict[str, int] = {}
         self._tp_size = int(getattr(transformer_graph, "tp", 1))
         self._cp_size = int(getattr(transformer_graph, "cp", 1))
-        self._lp_size = int(getattr(pipeline_graph, "lp", 1))
+        self._ep_size = int(ep_size)
+        self._pp_size = int(getattr(pipeline_graph, "pp", 1))
         if rank_layout is not None:
             self._configure_rank_layout(rank_layout)
 
@@ -375,10 +401,12 @@ class PipelineGraphFlattener:
         self._layout_axis_strides = axis_strides
         self._tp_size = max(1, axis_sizes.get("tp", self._tp_size))
         self._cp_size = max(1, axis_sizes.get("cp", self._cp_size))
-        self._lp_size = max(1, axis_sizes.get("lp", self._lp_size))
-        if self._par_degree != self._tp_size * self._cp_size:
+        self._ep_size = max(1, axis_sizes.get("ep", self._ep_size))
+        self._pp_size = max(1, axis_sizes.get("pp", self._pp_size))
+        if self._par_degree != self._tp_size * self._cp_size * self._ep_size:
             raise ValueError(
-                f"Inconsistent tensor/context parallel factors: tp={self._tp_size}, cp={self._cp_size}, "
+                f"Inconsistent tensor/context/expert parallel factors: tp={self._tp_size}, cp={self._cp_size}, "
+                f"ep={self._ep_size}, "
                 f"product does not equal par_degree={self._par_degree}"
             )
         stage_span = 1
@@ -670,6 +698,13 @@ class PipelineGraphFlattener:
         micro_batch = getattr(node, "micro_batch_index", None)
         layer_index = getattr(node, "layer_index", None)
         direction = getattr(node, "direction", "forward" if node.fwd else "backward")
+        is_moe_layer = bool(getattr(node, "is_moe_layer", False))
+        graph_for_layer = (
+            self.moe_transformer_graph if is_moe_layer and self.moe_transformer_graph else self.transformer_graph
+        )
+        gemm_entries = (
+            self._gemm_entries_moe if is_moe_layer and self._gemm_entries_moe else self._gemm_entries
+        )
 
         rank_heads: List[Any] = []
         rank_tails: List[Any] = []
@@ -679,9 +714,9 @@ class PipelineGraphFlattener:
             head: Optional[Any] = None
             hw_id = self._hw_id_for_rank(stage_id, tp_rank)
 
-            gemm_iterable = self._gemm_entries
+            gemm_iterable = gemm_entries
             if direction == "backward":
-                gemm_iterable = list(reversed(self._gemm_entries))
+                gemm_iterable = list(reversed(gemm_entries))
 
             for gemm_idx, entry in enumerate(gemm_iterable):
                 entry_name = entry.get("name", f"g{gemm_idx}")
@@ -707,6 +742,7 @@ class PipelineGraphFlattener:
                 gemm_node.direction = direction
                 gemm_node.recompute = bool(getattr(node, "recompute", False))
                 gemm_node.param_gather = (gemm_idx == 0)
+                gemm_node.is_moe_layer = is_moe_layer
 
                 if previous is not None:
                     previous.add_child(gemm_node)
@@ -723,6 +759,7 @@ class PipelineGraphFlattener:
                         layer_index,
                         direction,
                         tp_rank,
+                        graph_override=graph_for_layer,
                     )
                     previous.add_child(comm_edge)
                     previous = comm_edge
@@ -806,7 +843,7 @@ class PipelineGraphFlattener:
                         comm_size_bytes=per_rank_bytes,
                         comm_type=CollectiveType.PIPELINE,
                         participants=2,
-                        comm_interconnect_type="lp",
+                        comm_interconnect_type="pp",
                     )
                     edge_obj.is_cross_layer = True
                     tail.add_child(edge_obj)
@@ -870,11 +907,14 @@ class PipelineGraphFlattener:
         layer_index: Optional[int],
         direction: str,
         tp_rank: int,
+        *,
+        graph_override: Optional[Graph] = None,
     ) -> llm_simulation.Edge:
-        comm_info = self.transformer_graph.comm_metadata.get(comm_key, {})
+        graph = graph_override or self.transformer_graph
+        comm_info = graph.comm_metadata.get(comm_key, {})
         is_dp_edge = comm_info.get("interconnect_type") == "dp"
 
-        comm_edge = self.transformer_graph.create_comm_edge(
+        comm_edge = graph.create_comm_edge(
             name=comm_key,
             op_id=self._next_op_id(),
             comm_key=comm_key,
@@ -897,6 +937,7 @@ class PipelineGraphFlattener:
             "tp_rank",
             "mem_kind",
             "recompute",
+            "is_moe_layer",
         ):
             if hasattr(source, attr):
                 setattr(target, attr, getattr(source, attr))
@@ -944,10 +985,12 @@ class PipelineGraphFlattener:
             coords["tp"] = tp_rank_int % self._tp_size
         if "cp" in self._layout_axis_order:
             coords["cp"] = (tp_rank_int // self._tp_size) % self._cp_size
-        if "lp" in self._layout_axis_order:
-            if stage_int < 0 or stage_int >= self._lp_size:
-                raise ValueError(f"stage_id {stage_int} is out of range for lp={self._lp_size}")
-            coords["lp"] = stage_int % self._lp_size
+        if "ep" in self._layout_axis_order:
+            coords["ep"] = (tp_rank_int // max(1, self._tp_size * self._cp_size)) % self._ep_size
+        if "pp" in self._layout_axis_order:
+            if stage_int < 0 or stage_int >= self._pp_size:
+                raise ValueError(f"stage_id {stage_int} is out of range for pp={self._pp_size}")
+            coords["pp"] = stage_int % self._pp_size
 
         linear_rank = 0
         for axis in self._layout_axis_order:
@@ -972,6 +1015,9 @@ class LLMExecutionDispatcher:
         transformer_graph: Optional[Graph] = None,
         transformer_forward_root: Optional[Any] = None,
         transformer_backward_root: Optional[Any] = None,
+        moe_transformer_graph: Optional[Graph] = None,
+        moe_transformer_forward_root: Optional[Any] = None,
+        moe_transformer_backward_root: Optional[Any] = None,
         no_data_parallel: bool = False,
     ) -> None:
         self.time_calc = time_calc
@@ -981,6 +1027,9 @@ class LLMExecutionDispatcher:
         self.transformer_graph = transformer_graph
         self.transformer_forward_root = transformer_forward_root
         self.transformer_backward_root = transformer_backward_root
+        self.moe_transformer_graph = moe_transformer_graph
+        self.moe_transformer_forward_root = moe_transformer_forward_root
+        self.moe_transformer_backward_root = moe_transformer_backward_root
         self.flattened_root: Optional[Any] = None
         self._transformer_rank_layout: Dict[str, Any] = {}
         self._pipeline_rank_layout: Dict[str, Any] = {}
@@ -988,7 +1037,9 @@ class LLMExecutionDispatcher:
         self._axis_dimension_map: Dict[str, int] = {}
         self._transformer_stage_dp_faults: Dict[Tuple[int, int], Tuple[Tuple[int, int, float], ...]] = {}
         self._transformer_stage_timings: Dict[Tuple[int, int], TransformerTimings] = {}
+        self._transformer_stage_moe_timings: Dict[Tuple[int, int], TransformerTimings] = {}
         self._transformer_baseline_timings: Optional[TransformerTimings] = None
+        self._transformer_moe_baseline_timings: Optional[TransformerTimings] = None
         self.no_data_parallel = bool(no_data_parallel)
         self._rank_layout = self._build_rank_layout_descriptor()
         self._first_dim_optimize_cfg: Optional[Dict[str, Any]] = getattr(self, "_first_dim_optimize_cfg", None)
@@ -1038,17 +1089,19 @@ class LLMExecutionDispatcher:
 
         tp_size = _safe_int(getattr(self.pipeline_graph, "tp", getattr(self.time_calc, "tp", 1)))
         cp_size = _safe_int(getattr(self.pipeline_graph, "cp", getattr(self.time_calc, "cp", 1)))
-        lp_size = _safe_int(getattr(self.pipeline_graph, "lp", getattr(self.time_calc, "lp", 1)))
+        ep_size = _safe_int(getattr(self.time_calc, "ep", 1))
+        pp_size = _safe_int(getattr(self.pipeline_graph, "pp", getattr(self.time_calc, "pp", 1)))
         dp_size = _safe_int(getattr(self.time_calc, "dp", 1))
 
-        axis_sizes: Dict[str, int] = {"tp": tp_size, "cp": cp_size, "lp": lp_size, "dp": dp_size}
+        axis_sizes: Dict[str, int] = {"tp": tp_size, "cp": cp_size, "ep": ep_size, "pp": pp_size, "dp": dp_size}
         axis_order: List[str] = []
 
         # Enforce axis ordering for hierarchical/hybrid modes: the first active
-        # dimension must contain exactly {'tp','cp'}. Subsequent active
-        # dimensions may contain 'lp' (optionally combined with 'dp'). This
+        # dimension must contain exactly {'tp','cp','ep'} (or the active subset).
+        # Subsequent active
+        # dimensions may contain 'pp' (optionally combined with 'dp'). This
         # matches the assumptions in the hierarchical graphs where a stage is a
-        # TP/CP cluster replicated across LP (and potentially DP) axes.
+        # TP/CP/EP cluster replicated across PP (and potentially DP) axes.
         enforce_layout = self.time_calc.execution_mode in {
             ExecutionMode.HYBRID,
             ExecutionMode.FULL_ASTRASIM_HIERARCHICAL,
@@ -1061,11 +1114,13 @@ class LLMExecutionDispatcher:
 
             axes_without_dp = [axis for axis in dim_axes if axis != "dp"]
             if enforce_layout and declared > 1 and not first_active_checked and axes_without_dp:
-                canon = sorted(axes_without_dp)
-                if canon != ["cp", "tp"] and canon != ["tp", "cp"] and (axis_sizes["tp"] > 1 or axis_sizes["cp"] > 1):
+                active_axes = [axis for axis in ("tp", "cp", "ep") if axis_sizes[axis] > 1]
+                canon_active = sorted([axis for axis in axes_without_dp if axis_sizes[axis] > 1])
+                expected = sorted(active_axes)
+                if expected and canon_active != expected:
                     raise ValueError(
                         "For hierarchical/hybrid AstraSim modes, the first active network "
-                        "dimension must contain exactly {'tp','cp'} to represent the tensor/context cluster."
+                        "dimension must contain the active TP/CP/EP axes to represent the transformer cluster."
                     )
                 first_active_checked = True
 
@@ -1073,7 +1128,7 @@ class LLMExecutionDispatcher:
                 if name not in axis_sizes:
                     raise ValueError(
                         f"Unsupported parallelism axis '{name}' in network layout. "
-                        "Supported axes for AstraSim integration are: tp, cp, lp, dp."
+                        "Supported axes for AstraSim integration are: tp, cp, ep, pp, dp."
                     )
                 if name not in axis_order:
                     axis_order.append(name)
@@ -1087,13 +1142,19 @@ class LLMExecutionDispatcher:
                     f"size mismatch: declared {declared}, but parallelism factors imply {expected}."
                 )
 
+        if axis_order:
+            ordered_axes = ["tp", "cp", "ep", "pp", "dp"]
+            axis_order = [axis for axis in ordered_axes if axis in axis_order]
+
         # Ensure the layout covers active parallel axes
         if tp_size > 1 and "tp" not in axis_order:
             raise ValueError("Network layout must include 'tp' when tensor parallelism > 1.")
         if cp_size > 1 and "cp" not in axis_order:
             raise ValueError("Network layout must include 'cp' when context parallelism > 1.")
-        if lp_size > 1 and "lp" not in axis_order:
-            raise ValueError("Network layout must include 'lp' when pipeline parallelism > 1.")
+        if ep_size > 1 and "ep" not in axis_order:
+            raise ValueError("Network layout must include 'ep' when expert parallelism > 1.")
+        if pp_size > 1 and "pp" not in axis_order:
+            raise ValueError("Network layout must include 'pp' when pipeline parallelism > 1.")
 
         axis_strides: Dict[str, int] = {}
         span = 1
@@ -1124,11 +1185,11 @@ class LLMExecutionDispatcher:
                 "stage_span": span,
             }
 
-        # Transformer graphs only encode TP/CP axes; pipeline graphs encode LP
+        # Transformer graphs only encode TP/CP axes; pipeline graphs encode PP
         # (DP replicas are handled externally). Store these subsets so callers
         # can attach the appropriate layout before invoking AstraSim.
-        self._transformer_rank_layout = _subset_layout(["tp", "cp"])
-        self._pipeline_rank_layout = _subset_layout(["lp", "dp"])
+        self._transformer_rank_layout = _subset_layout(["tp", "cp", "ep"])
+        self._pipeline_rank_layout = _subset_layout(["pp", "dp"])
 
         return descriptor
 
@@ -1306,8 +1367,8 @@ class LLMExecutionDispatcher:
             return {}
         stage_dp_faults: Dict[Tuple[int, int], List[Tuple[int, int, float]]] = {}
         for detail in projection.entries:
-            src_stage = self._axis_value_from_coords(detail.src_coords, "lp")
-            dst_stage = self._axis_value_from_coords(detail.dst_coords, "lp")
+            src_stage = self._axis_value_from_coords(detail.src_coords, "pp")
+            dst_stage = self._axis_value_from_coords(detail.dst_coords, "pp")
             if src_stage != dst_stage:
                 raise ValueError(
                     "Transformer faulty link spans multiple pipeline stages; "
@@ -1378,7 +1439,7 @@ class LLMExecutionDispatcher:
     def _run_hybrid(self) -> ExecutionResult:
         generate_graphs = _env_flag("RAPID_VISUALIZE_GRAPHS")
 
-        transformer_time = self._run_transformer_astrasim(ExecutionMode.HYBRID)
+        transformer_time, moe_transformer_time = self._run_transformer_astrasim(ExecutionMode.HYBRID)
 
         
         if generate_graphs:
@@ -1402,24 +1463,41 @@ class LLMExecutionDispatcher:
                 self.time_calc.output_dir,
                 "/hybrid_graph_transformer_backward",
             )
+            if self.moe_transformer_graph and self.moe_transformer_forward_root:
+                moe_forward_root = self.moe_transformer_graph.convert_comm_sizes_to_times(
+                    self.moe_transformer_forward_root,
+                    self.time_calc.network_model,
+                    self.interconnect_params,
+                )
+                self.moe_transformer_graph.save_graph(
+                    moe_forward_root,
+                    self.time_calc.output_dir,
+                    "/hybrid_graph_transformer_forward_moe",
+                )
+            if self.moe_transformer_graph and self.moe_transformer_backward_root:
+                moe_backward_root = self.moe_transformer_graph.convert_comm_sizes_to_times(
+                    self.moe_transformer_backward_root,
+                    self.time_calc.network_model,
+                    self.interconnect_params,
+                )
+                self.moe_transformer_graph.save_graph(
+                    moe_backward_root,
+                    self.time_calc.output_dir,
+                    "/hybrid_graph_transformer_backward_moe",
+                )
 
-        if transformer_time is not None:
-            self._apply_transformer_time(transformer_time)
+        if transformer_time is not None or moe_transformer_time is not None:
+            self._apply_transformer_time(transformer_time, moe_transformer_time)
         return self._run_pipeline_with_analytical_comm(ExecutionMode.HYBRID)
 
     def _run_full_astrasim_hierarchical(self) -> ExecutionResult:
-        transformer_time = self._run_transformer_astrasim(ExecutionMode.FULL_ASTRASIM_HIERARCHICAL)
-        if transformer_time is not None:
-            self._apply_transformer_time(transformer_time)
+        transformer_time, moe_transformer_time = self._run_transformer_astrasim(ExecutionMode.FULL_ASTRASIM_HIERARCHICAL)
+        if transformer_time is not None or moe_transformer_time is not None:
+            self._apply_transformer_time(transformer_time, moe_transformer_time)
 
         if _env_flag("RAPID_VISUALIZE_GRAPHS") and self.transformer_graph:
             transformer_timed_forward_root = self.transformer_graph.convert_comm_sizes_to_times(
                 self.transformer_forward_root,
-                self.time_calc.network_model,
-                self.interconnect_params,
-            )
-            transformer_timed_backward_root = self.transformer_graph.convert_comm_sizes_to_times(
-                self.transformer_backward_root,
                 self.time_calc.network_model,
                 self.interconnect_params,
             )
@@ -1428,11 +1506,39 @@ class LLMExecutionDispatcher:
                 self.time_calc.output_dir,
                 "/hierarchical_graph_transformer_forward",
             )
-            self.transformer_graph.save_graph(
-                transformer_timed_backward_root,
-                self.time_calc.output_dir,
-                "/hierarchical_graph_transformer_backward",
-            )
+            if self.transformer_backward_root is not None:
+                transformer_timed_backward_root = self.transformer_graph.convert_comm_sizes_to_times(
+                    self.transformer_backward_root,
+                    self.time_calc.network_model,
+                    self.interconnect_params,
+                )
+                self.transformer_graph.save_graph(
+                    transformer_timed_backward_root,
+                    self.time_calc.output_dir,
+                    "/hierarchical_graph_transformer_backward",
+                )
+            if self.moe_transformer_graph and self.moe_transformer_forward_root:
+                moe_forward_root = self.moe_transformer_graph.convert_comm_sizes_to_times(
+                    self.moe_transformer_forward_root,
+                    self.time_calc.network_model,
+                    self.interconnect_params,
+                )
+                self.moe_transformer_graph.save_graph(
+                    moe_forward_root,
+                    self.time_calc.output_dir,
+                    "/hierarchical_graph_transformer_forward_moe",
+                )
+            if self.moe_transformer_graph and self.moe_transformer_backward_root:
+                moe_backward_root = self.moe_transformer_graph.convert_comm_sizes_to_times(
+                    self.moe_transformer_backward_root,
+                    self.time_calc.network_model,
+                    self.interconnect_params,
+                )
+                self.moe_transformer_graph.save_graph(
+                    moe_backward_root,
+                    self.time_calc.output_dir,
+                    "/hierarchical_graph_transformer_backward_moe",
+                )
 
         dp_count = getattr(self.time_calc, "dp", 1) or 1
         if not self.pipeline_root:
@@ -1482,6 +1588,8 @@ class LLMExecutionDispatcher:
         return ExecutionResult(total_time=max_sec, graph_root=self.pipeline_root, mode=ExecutionMode.FULL_ASTRASIM_HIERARCHICAL)
 
     def _run_full_astrasim_flattened(self) -> ExecutionResult:
+        if self.moe_transformer_graph is not None:
+            raise NotImplementedError("MoE is not supported with full AstraSim flattened execution.")
         if not self.pipeline_root:
             raise RuntimeError("Pipeline graph root is not available for flattening")
         if not self.transformer_graph:
@@ -1490,6 +1598,7 @@ class LLMExecutionDispatcher:
         flattener = PipelineGraphFlattener(
             pipeline_graph=self.pipeline_graph,
             transformer_graph=self.transformer_graph,
+            moe_transformer_graph=self.moe_transformer_graph,
             rank_layout=self._rank_layout,
         )
 
@@ -1607,6 +1716,7 @@ class LLMExecutionDispatcher:
         flattener = PipelineGraphFlattener(
             pipeline_graph=self.pipeline_graph,
             transformer_graph=self.transformer_graph,
+            moe_transformer_graph=self.moe_transformer_graph,
             rank_layout=self._rank_layout,
         )
         flattened_root = flattener.build(self.pipeline_root)
@@ -1661,51 +1771,96 @@ class LLMExecutionDispatcher:
 
 
 
-    def _run_transformer_astrasim(self, mode: ExecutionMode) -> Optional[TransformerTimings]:
+    def _run_transformer_astrasim(
+        self,
+        mode: ExecutionMode,
+    ) -> Tuple[Optional[TransformerTimings], Optional[TransformerTimings]]:
         del mode  # mode currently unused but kept for signature consistency
 
-        if not self.transformer_forward_root and not self.transformer_backward_root:
+        has_dense = bool(self.transformer_forward_root or self.transformer_backward_root)
+        has_moe = bool(self.moe_transformer_forward_root or self.moe_transformer_backward_root)
+        if not has_dense and not has_moe:
             if getattr(self, "_transformer_stage_dp_faults", {}):
                 raise ValueError("Transformer faults require transformer graph metadata, but none is available.")
-            return None
+            return None, None
 
         layout = getattr(self, "_transformer_rank_layout", {})
         if self.transformer_forward_root:
             setattr(self.transformer_forward_root, "_astrasim_rank_layout", layout)
         if self.transformer_backward_root:
             setattr(self.transformer_backward_root, "_astrasim_rank_layout", layout)
+        if self.moe_transformer_forward_root:
+            setattr(self.moe_transformer_forward_root, "_astrasim_rank_layout", layout)
+        if self.moe_transformer_backward_root:
+            setattr(self.moe_transformer_backward_root, "_astrasim_rank_layout", layout)
 
         persist = self.time_calc.persist_astrasim_artifacts
         os.makedirs(self.time_calc.output_dir, exist_ok=True)
         self._transformer_stage_timings = {}
+        self._transformer_stage_moe_timings = {}
         self._transformer_baseline_timings = None
+        self._transformer_moe_baseline_timings = None
 
-        # Baseline run (no transformer faults)
-        baseline_fwd_dir, baseline_bwd_dir = self._transformer_artifact_dirs(label=None, persist=persist)
-        baseline_timings, baseline_fwd_per_rank, baseline_bwd_per_rank = self._execute_transformer_run(
-            baseline_fwd_dir,
-            baseline_bwd_dir,
-            faulty_links_override=(),
-        )
-        self._transformer_baseline_timings = baseline_timings
-        self.time_calc.transformer_astrasim_per_rank_forward = baseline_fwd_per_rank
-        self.time_calc.transformer_astrasim_per_rank_backward = baseline_bwd_per_rank
-        self.time_calc.transformer_astrasim_time_forward = baseline_timings.forward
-        self.time_calc.transformer_astrasim_time_backward = baseline_timings.backward
-
-        # Per-stage fault runs
-        stage_dp_faults = getattr(self, "_transformer_stage_dp_faults", {})
-        for fault_index, ((dp_idx, stage_id), fault_links) in enumerate(sorted(stage_dp_faults.items())):
-            label = f"fault{fault_index}_dp{dp_idx}_stage{stage_id}"
-            stage_fwd_dir, stage_bwd_dir = self._transformer_artifact_dirs(label=label, persist=persist)
-            stage_timings, _, _ = self._execute_transformer_run(
-                stage_fwd_dir,
-                stage_bwd_dir,
-                faulty_links_override=fault_links,
+        baseline_timings: Optional[TransformerTimings] = None
+        if has_dense:
+            # Baseline run (no transformer faults)
+            baseline_fwd_dir, baseline_bwd_dir = self._transformer_artifact_dirs(label=None, persist=persist)
+            baseline_timings, baseline_fwd_per_rank, baseline_bwd_per_rank = self._execute_transformer_run(
+                baseline_fwd_dir,
+                baseline_bwd_dir,
+                forward_root=self.transformer_forward_root,
+                backward_root=self.transformer_backward_root,
+                faulty_links_override=(),
             )
-            self._transformer_stage_timings[(dp_idx, stage_id)] = stage_timings
+            self._transformer_baseline_timings = baseline_timings
+            self.time_calc.transformer_astrasim_per_rank_forward = baseline_fwd_per_rank
+            self.time_calc.transformer_astrasim_per_rank_backward = baseline_bwd_per_rank
+            self.time_calc.transformer_astrasim_time_forward = baseline_timings.forward
+            self.time_calc.transformer_astrasim_time_backward = baseline_timings.backward
 
-        return baseline_timings
+            # Per-stage fault runs (dense only)
+            stage_dp_faults = getattr(self, "_transformer_stage_dp_faults", {})
+            for fault_index, ((dp_idx, stage_id), fault_links) in enumerate(sorted(stage_dp_faults.items())):
+                label = f"fault{fault_index}_dp{dp_idx}_stage{stage_id}"
+                stage_fwd_dir, stage_bwd_dir = self._transformer_artifact_dirs(label=label, persist=persist)
+                stage_timings, _, _ = self._execute_transformer_run(
+                    stage_fwd_dir,
+                    stage_bwd_dir,
+                    forward_root=self.transformer_forward_root,
+                    backward_root=self.transformer_backward_root,
+                    faulty_links_override=fault_links,
+                )
+                self._transformer_stage_timings[(dp_idx, stage_id)] = stage_timings
+
+        moe_timings: Optional[TransformerTimings] = None
+        if has_moe:
+            stage_dp_faults = getattr(self, "_transformer_stage_dp_faults", {})
+            moe_fwd_dir, moe_bwd_dir = self._transformer_artifact_dirs(label="moe", persist=persist)
+            moe_timings, moe_fwd_per_rank, moe_bwd_per_rank = self._execute_transformer_run(
+                moe_fwd_dir,
+                moe_bwd_dir,
+                forward_root=self.moe_transformer_forward_root,
+                backward_root=self.moe_transformer_backward_root,
+                faulty_links_override=(),
+            )
+            self._transformer_moe_baseline_timings = moe_timings
+            self.time_calc.transformer_astrasim_per_rank_forward_moe = moe_fwd_per_rank
+            self.time_calc.transformer_astrasim_per_rank_backward_moe = moe_bwd_per_rank
+            self.time_calc.transformer_astrasim_time_forward_moe = moe_timings.forward
+            self.time_calc.transformer_astrasim_time_backward_moe = moe_timings.backward
+            for fault_index, ((dp_idx, stage_id), fault_links) in enumerate(sorted(stage_dp_faults.items())):
+                label = f"moe_fault{fault_index}_dp{dp_idx}_stage{stage_id}"
+                stage_fwd_dir, stage_bwd_dir = self._transformer_artifact_dirs(label=label, persist=persist)
+                stage_timings, _, _ = self._execute_transformer_run(
+                    stage_fwd_dir,
+                    stage_bwd_dir,
+                    forward_root=self.moe_transformer_forward_root,
+                    backward_root=self.moe_transformer_backward_root,
+                    faulty_links_override=fault_links,
+                )
+                self._transformer_stage_moe_timings[(dp_idx, stage_id)] = stage_timings
+
+        return baseline_timings, moe_timings
 
     def _transformer_artifact_dirs(self, label: Optional[str], persist: bool) -> Tuple[str, str]:
         if not persist:
@@ -1729,6 +1884,8 @@ class LLMExecutionDispatcher:
         artifact_dir_fwd: str,
         artifact_dir_bwd: str,
         *,
+        forward_root: Optional[Any],
+        backward_root: Optional[Any],
         faulty_links_override: Optional[Tuple[Tuple[int, int, float], ...]],
     ) -> Tuple[TransformerTimings, Optional[List[float]], Optional[List[float]]]:
         fwd_per_rank = None
@@ -1736,9 +1893,9 @@ class LLMExecutionDispatcher:
         fwd_max = 0
         bwd_max = 0
 
-        if self.transformer_forward_root:
+        if forward_root:
             fwd_per_rank, fwd_max = run_astra_simulation_only_onepath(
-                self.transformer_forward_root,
+                forward_root,
                 self.time_calc,
                 artifact_dir_fwd,
                 dp_override=1,
@@ -1748,9 +1905,9 @@ class LLMExecutionDispatcher:
             if fwd_max <= 0:
                 raise RuntimeError("AstraSim transformer forward execution returned non-positive duration")
 
-        if self.transformer_backward_root:
+        if backward_root:
             bwd_per_rank, bwd_max = run_astra_simulation_only_onepath(
-                self.transformer_backward_root,
+                backward_root,
                 self.time_calc,
                 artifact_dir_bwd,
                 dp_override=1,
@@ -1762,19 +1919,33 @@ class LLMExecutionDispatcher:
 
         return TransformerTimings(forward=fwd_max, backward=bwd_max), fwd_per_rank, bwd_per_rank
 
-    def _apply_transformer_time(self, timings: TransformerTimings) -> None:
-        if timings.forward < 0 or timings.backward < 0:
+    def _apply_transformer_time(
+        self,
+        timings: Optional[TransformerTimings],
+        moe_timings: Optional[TransformerTimings] = None,
+    ) -> None:
+        if timings is None and moe_timings is None:
+            return
+        if timings is not None and (timings.forward < 0 or timings.backward < 0):
+            raise ValueError("AstraSim transformer times must be positive")
+        if moe_timings is not None and (moe_timings.forward < 0 or moe_timings.backward < 0):
             raise ValueError("AstraSim transformer times must be positive")
 
-        baseline_timings = self._transformer_baseline_timings or timings
+        baseline_timings = timings or self._transformer_baseline_timings
+        moe_baseline_timings = moe_timings or self._transformer_moe_baseline_timings
         stage_timings = getattr(self, "_transformer_stage_timings", {})
+        stage_moe_timings = getattr(self, "_transformer_stage_moe_timings", {})
 
         comp_times = getattr(self.pipeline_graph, "comp_times", None)
         if isinstance(comp_times, dict):
-            if "transformer_f" in comp_times:
+            if baseline_timings:
                 comp_times["transformer_f"] = baseline_timings.forward
-            if "transformer_b" in comp_times:
                 comp_times["transformer_b"] = baseline_timings.backward
+                comp_times["transformer_f_dense"] = baseline_timings.forward
+                comp_times["transformer_b_dense"] = baseline_timings.backward
+            if moe_baseline_timings:
+                comp_times["transformer_f_moe"] = moe_baseline_timings.forward
+                comp_times["transformer_b_moe"] = moe_baseline_timings.backward
 
         visited: Set[int] = set()
         roots: List[Any]
@@ -1794,8 +1965,9 @@ class LLMExecutionDispatcher:
                 root,
                 visited,
                 stage_timings,
-                baseline_timings.forward,
-                baseline_timings.backward,
+                stage_moe_timings,
+                baseline_timings,
+                moe_baseline_timings,
                 dp_count,
             )
 
@@ -1804,8 +1976,9 @@ class LLMExecutionDispatcher:
         node: Any,
         visited: Set[int],
         stage_timings: Dict[Tuple[int, int], TransformerTimings],
-        forward_default: float,
-        backward_default: float,
+        stage_moe_timings: Dict[Tuple[int, int], TransformerTimings],
+        dense_timings: Optional[TransformerTimings],
+        moe_timings: Optional[TransformerTimings],
         dp_count: int,
     ) -> None:
         if node is None:
@@ -1818,6 +1991,12 @@ class LLMExecutionDispatcher:
         if isinstance(node, llm_simulation.Node):
             base_name = str(getattr(node, "name", "") or "")
             if base_name.startswith("transformer_layer"):
+                is_moe_layer = bool(getattr(node, "is_moe_layer", False))
+                timing_source = moe_timings if is_moe_layer and moe_timings is not None else dense_timings
+                if timing_source is None:
+                    timing_source = dense_timings
+                if timing_source is None:
+                    return
                 hw_stage = None
                 try:
                     hw_stage = int(getattr(node, "hw_id", None))
@@ -1826,18 +2005,20 @@ class LLMExecutionDispatcher:
                 def _per_dp_durations(is_forward: bool) -> List[float]:
                     values: List[float] = []
                     for dp_idx in range(dp_count):
-                        timing_override = stage_timings.get((dp_idx, hw_stage)) if hw_stage is not None else None
+                        default = timing_source.forward if is_forward else timing_source.backward
+                        timing_override = None
+                        if hw_stage is not None:
+                            if is_moe_layer:
+                                timing_override = stage_moe_timings.get((dp_idx, hw_stage))
+                            else:
+                                timing_override = stage_timings.get((dp_idx, hw_stage))
                         if timing_override:
                             values.append(timing_override.forward if is_forward else timing_override.backward)
                         else:
-                            default = forward_default if is_forward else backward_default
                             values.append(default)
                     return values
 
-                if getattr(node, "fwd", True):
-                    per_dp_values = _per_dp_durations(is_forward=True)
-                else:
-                    per_dp_values = _per_dp_durations(is_forward=False)
+                per_dp_values = _per_dp_durations(is_forward=bool(getattr(node, "fwd", True)))
 
                 if dp_count > 1:
                     node.duration = tuple(per_dp_values)
@@ -1845,4 +2026,12 @@ class LLMExecutionDispatcher:
                     node.duration = per_dp_values[0]
 
         for child in getattr(node, "children", []):
-            self._assign_transformer_durations(child, visited, stage_timings, forward_default, backward_default, dp_count)
+            self._assign_transformer_durations(
+                child,
+                visited,
+                stage_timings,
+                stage_moe_timings,
+                dense_timings,
+                moe_timings,
+                dp_count,
+            )

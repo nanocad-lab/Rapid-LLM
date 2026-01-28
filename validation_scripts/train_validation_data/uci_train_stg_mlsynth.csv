@@ -1,0 +1,93 @@
+variant,tp,pp,cp,dp,label,stg_seconds,stg_error,mlsynth_seconds,mlsynth_error,result_path,stg_seconds_rerun,stg_error_rerun,mlsynth_seconds_rerun,mlsynth_error_rerun
+DDP,1,1,1,4,DDP TP=1 PP=1 CP=1 DP=4,22.293930148,,24.80239542,,tools/comp/wrapper_outputs/uci_train/Llama2-7B__a100_80GB_final/DDP_TP_1_PP_1_CP_1_DP_4/result.json,,,,
+DDP,1,4,1,1,DDP TP=1 PP=4 CP=1 DP=1,23.661538313,,25.192850014,,tools/comp/wrapper_outputs/uci_train/Llama2-7B__a100_80GB_final/DDP_TP_1_PP_4_CP_1_DP_1/result.json,,,,
+DDP,2,1,1,2,DDP TP=2 PP=1 CP=1 DP=2,22.692190885000002,,51.845410443000006,,tools/comp/wrapper_outputs/uci_train/Llama2-7B__a100_80GB_final/DDP_TP_2_PP_1_CP_1_DP_2/result.json,,,,
+DDP,2,2,1,1,DDP TP=2 PP=2 CP=1 DP=1,22.669383639000003,,52.325826044,,tools/comp/wrapper_outputs/uci_train/Llama2-7B__a100_80GB_final/DDP_TP_2_PP_2_CP_1_DP_1/result.json,,,,
+DDP,1,1,2,2,DDP TP=1 PP=1 CP=2 DP=2,22.398156833,,,,tools/comp/wrapper_outputs/uci_train/Llama2-7B__a100_80GB_final/DDP_TP_1_PP_1_CP_2_DP_2/result.json,,,,
+DDP,1,2,2,1,DDP TP=1 PP=2 CP=2 DP=1,35.539263924000004,,,,tools/comp/wrapper_outputs/uci_train/Llama2-7B__a100_80GB_final/DDP_TP_1_PP_2_CP_2_DP_1/result.json,,,,
+DDP,1,1,2,2,DDP TP=1 PP=1 CP=2 DP=2,,"STG generator failed with return code 1
+STG output:
+... (last 40 lines; 45 total)
+transformer.4._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.5._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.6._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.7._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.8._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.9._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.10._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.11._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.12._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.13._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.14._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.15._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.16._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.17._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.18._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.19._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.20._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.21._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.22._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.23._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.24._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.25._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.26._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.27._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.28._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.29._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.30._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.31._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+in_emb.w: [Dvocal/tp, Dmodel] @ [MicroBatch/dp, Seq/cp]
+out_emb.w: [Dmodel/tp, Dvocal] @ [MicroBatch/dp, Seq/cp]
+Traceback (most recent call last):
+  File ""/w/ee.00/puneet/nanoproj/users/binglu/Rapid-LLM/symbolic_tensor_graph/main.py"", line 568, in <module>
+    main()
+  File ""/w/ee.00/puneet/nanoproj/users/binglu/Rapid-LLM/symbolic_tensor_graph/main.py"", line 286, in main
+    pipeline_tensor_map = _create_pipeline_tensor_map(
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/w/ee.00/puneet/nanoproj/users/binglu/Rapid-LLM/symbolic_tensor_graph/main.py"", line 85, in _create_pipeline_tensor_map
+    for i in range(num_stacks - range_ * (num_stacks // range_)):
+                                          ~~~~~~~~~~~^^~~~~~~~
+ZeroDivisionError: integer division or modulo by zero",,,tools/comp/wrapper_outputs/uci_train/Llama2-7B__a100_80GB_works_uci_41_final/DDP_TP_1_PP_1_CP_2_DP_2/result.json,,,,
+DDP,1,2,2,1,DDP TP=1 PP=2 CP=2 DP=1,,"STG generator failed with return code 1
+STG output:
+... (last 40 lines; 45 total)
+transformer.4._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.5._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.6._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.7._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.8._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.9._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.10._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.11._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.12._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.13._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.14._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.15._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.16._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.17._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.18._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.19._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.20._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.21._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.22._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.23._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.24._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.25._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.26._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.27._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.28._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.29._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.30._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+transformer.31._sharded_weight: [2*Dff*Dmodel/tp + 4*Dmodel**2/tp] @ [1]
+in_emb.w: [Dvocal/tp, Dmodel] @ [MicroBatch/dp, Seq/cp]
+out_emb.w: [Dmodel/tp, Dvocal] @ [MicroBatch/dp, Seq/cp]
+Traceback (most recent call last):
+  File ""/w/ee.00/puneet/nanoproj/users/binglu/Rapid-LLM/symbolic_tensor_graph/main.py"", line 568, in <module>
+    main()
+  File ""/w/ee.00/puneet/nanoproj/users/binglu/Rapid-LLM/symbolic_tensor_graph/main.py"", line 286, in main
+    pipeline_tensor_map = _create_pipeline_tensor_map(
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/w/ee.00/puneet/nanoproj/users/binglu/Rapid-LLM/symbolic_tensor_graph/main.py"", line 85, in _create_pipeline_tensor_map
+    for i in range(num_stacks - range_ * (num_stacks // range_)):
+                                          ~~~~~~~~~~~^^~~~~~~~
+ZeroDivisionError: integer division or modulo by zero",,,tools/comp/wrapper_outputs/uci_train/Llama2-7B__a100_80GB_works_uci_41_final/DDP_TP_1_PP_2_CP_2_DP_1/result.json,,,,

@@ -214,19 +214,23 @@ Comparing the two runs will show how increasing tensor parallelism changes the p
 
 ### AstraSim Integration
 - **Supported:** AstraSim integration is supported for all LLM execution modes.
-- **Work in progress:** AstraSim integration is not fully validated, and only supports 1D network topologies.
+
+### Network Topologies
+- **Supported:** 1D and 2D topologies (+SuperPOD-style Fat Tree) in AstraSim configs.
+
+### Faulty Links
+- **Supported:** Faulty links are supported in AstraSim runs. We support soft (bandwidth derate, all cases) and hard (link failure, dense 2D topologies only) link failures. Hierarchical/flattened mode only.
 
 ### FlashAttention
 - **Current support:**
-  - Forward pass for training
-  - Prefill phase in inference
+  - Training and inference(prefill only).
 - **Work in progress:**
-  - Attention tile size is currently manually defined.
-  - Inference decode does not use FlashAttention (decode is memory-bound; FlashDecoding-style kernels are not implemented).
+  - Attention tile size is manually specified when FlashAttention is enabled.
+  - Inference decode is memory bound and does not typically benefit from FlashAttention. Hence it is disabled. FlashDecoding kernels are not implemented.
 
 ### Data Parallelism
 - **Supported:** training and inference.
-- For inference, DP acts as a replica multiplier; replicas do not communicate.
+- For inference, `replica_count` scales throughput only and replicas do not communicate.
 
 ### Tensor Parallelism
 - **Supported:** training and inference.
@@ -237,8 +241,8 @@ Comparing the two runs will show how increasing tensor parallelism changes the p
 - GPipe-style pipeline scheduling only.
 
 ### Context Parallelism
-- **Supported:** training only.
-- Inference CP is WIP.
+- **Supported:** Training. No MoE support.
+- Inference CP is not supported yet.
 
 ### Hybrid Parallelism
 - **Supported:** Hybrid parallelism is supported for all LLM training/inference configurations with limitations listed for each parallelism type above.
@@ -248,13 +252,27 @@ Comparing the two runs will show how increasing tensor parallelism changes the p
 - **Work in progress:** MLA and sliding-window attention.
 
 ### Mixture of Experts (MoE)
-- **Supported:** Single-GPU case in both training and inference (WIP).
-- **Work in progress:** Multi-GPU expert parallelism and validation.
+- **Training support:**
+  - Single GPU and multi GPU expert parallelism
+  - TP with EP requires sequence parallelism
+- **Inference support:**
+  - TP GPUs are also used for expert parallelism
+  - `moe_dp` expands the expert pool. The routing group size is `tp * moe_dp`.
+- **Work in progress:**
+  - Validation coverage for large multi GPU MoE runs
+  - MoE with ZeRO-2/3 is not supported
+  - MoE with faulty links is not supported
+  - MoE is not supported with flattened AstraSim graphs
+
+### ZeRO and Optimizer Sharding
+- **Supported:** ZeRO stages 0 through 3 with parameter, gradient, and optimizer sharding. ZeRO-3 parameter materialization is modeled as communication and ephemeral memory. Hierarchical mode only, no MoE support.
+
+### Gradient Accumulation
+- **Supported:** Gradient accumulation is supported for training using `gradient_accumulation_steps`. No ZeRO-2/3 support.
 
 ### Memory Estimation
 - **Status:** Enabled.
-- **Supported:** Per-GPU peak from flattened graphs for training and inference. Training uses persistent vs transient activations (full/selective recompute supported). Inference uses `max(prefill peak, final decode peak)` and includes KV-cache bytes. 
-- **Not modeled:** Embedding/softmax activations or weights, comm buffers, allocator effects/fragmentation, MoE memory beyond single-GPU, or CP inference.
+- **Supported:** Per-GPU peak from flattened graphs for training and inference. Training uses persistent vs transient activations with full and selective recompute. Inference uses `max(prefill peak, final decode peak)` and includes KV-cache bytes plus embedding and LM head weights. Validated against 3000 case dataset, with ~95% accuracy (predicting OOM vs non-OOM).
 
 ### KV-Cache
 - **Supported:** KV-cache runtime impact and memory estimation (graph-based peak uses per-layer KV cache bytes).
@@ -264,10 +282,12 @@ Comparing the two runs will show how increasing tensor parallelism changes the p
 - **Work in progress:** Training support and refinement.
 
 ### Mixed Precision
-- **Supported:** Mixed precision is supported for all supported parallelism and model types.
-- **Work in progress:** KV cache precision cannot yet be set (config value is ignored).
+- **Supported:** Mixed precision is supported for all supported parallelism and model types, including configurable KV cache precision.
 
 ### Validation
 - **Status:** Validation scripts are available in validation_scripts folder. We also validate against Megatron-LM and other paper data for inference and training, including networking, for up to 3000 GPUs. Below is a validation plot against Koyeb's single NVIDIA A100 data on Llama3.1-8B. The relevant script can be found in `validation_scripts/koyeb.py`. A memory-estimator smoke test lives at `validation_scripts/memory_estimator_smoke.py`.
+- **NVIDIA inference validation:** `validation_scripts/nvidia_inf.py` runs RAPID-LLM inference validation against NVIDIA Llama 2 7B/13B/70B and Llama 3.3-70B datasets (A100 by default) references, then generates combined comparison plots (actual vs RAPID-LLM and optional LLMCompass/Vidur/GenZ) under `output/validation/inf`. Options: `--llmcompass`, `--vidur`, `--genz` (pick comparison tools; if any are set, only those run) and `--plot errors|ratio|both` (select plot type; default is `ratio`).
+- **Large-scale training validation:** `validation_scripts/nvidia_train_validation.py` runs RAPID-LLM training validation for NVIDIA large-scale training cases and writes per-run artifacts under `validation_scripts/train_validation_data/nvidia_train_validation_runs`, with results in `validation_scripts/train_validation_data/nvidia_train_validation_result.csv` and an optional comparison plot. Command: `./venv/bin/python validation_scripts/nvidia_train_validation.py`.
+- **4-GPU system training validation:** `validation_scripts/uci_train_validation.py` runs RAPID-LLM training validation on the 4-GPU UCI cases and writes per-run artifacts under `validation_scripts/train_validation_data/uci_train_validation_runs`, with results in `validation_scripts/train_validation_data/uci_train_validation_result.csv` and an optional comparison plot. Command: `./venv/bin/python validation_scripts/uci_train_validation.py`.
 
 ![Koyeb Validation](validation_scripts/koyeb_a100_sxm_no_parallelism.png)

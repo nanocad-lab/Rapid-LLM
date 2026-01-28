@@ -80,19 +80,25 @@ memory_hierarchy:
     scope: global
 
 parallelism:
-  dp: 2 # data parallelism. Acts as replica count during inference
   tp: 2 # tensor parallelism
   tp_sp: true # tensor-sequence parallelism
   cp: 2 # context parallelism. Not supported for inference.
-  lp: 4 # pipeline parallelism. Number of pipeline stages
+  pp: 4 # pipeline parallelism. Number of pipeline stages
   # mb is not a true parallelism parameter, does not affect num of GPUs.
-  mb: 4 # micro-batches (for best results set to >= lp). 
+  mb: 4 # micro-batches (for best results set to >= pp). 
 
+  train:
+    dp: 2 # data parallelism
+    ep: 1 # expert parallelism
+    # controls expert TP sharding: if false, tp and ep are applied separately to attn/FFN; if true, TP applies to both
+    tp_ep: true
+  inference:
+    replica_count: 2 # inference throughput scaling only
+    moe_dp: 1 # inference expert pool expansion (EP_eff = tp * moe_dp)
 network:
   # Global faulty links apply to the active AstraSim dimension: [[src, dst, weight]]
   # faulty_links: [[0,1,0.6],[16,17,0.1]]
   dimensions:
-    # currently only support astrasim integration with all devices in one node.
     - id: dim0
       label: torus2d_tp
       size: auto
@@ -115,7 +121,7 @@ network:
         energy_per_bit: 8e-12 # (J/bit)
         util: 1.0
       collective_override: {} # overrides execution_backend.collectives when provided
-      parallelisms: [lp,dp]
+      parallelisms: [pp,dp]
     - id: dim2
       label: inter_torus_infiniband_dp
       size: auto

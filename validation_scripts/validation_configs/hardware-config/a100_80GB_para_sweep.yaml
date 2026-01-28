@@ -13,11 +13,10 @@ sw_param:
     # Each field accepts: numeric byte counts, dtype strings (fp8/fp16/bf16/fp32), or "as_tensor_format"
     kv_cache: as_tensor_format # KV cache precision. WIP - currently ignored.
     parameters: as_tensor_format  # Model parameter precision
-    gradients: as_tensor_format  # Accumulated gradients
-    grad_microbatch: as_tensor_format  # Ephemeral per-microbatch gradients
-    grad_communication: as_tensor_format  # Gradient communication precision
-    optimizer_states: as_tensor_format  # Optimizer states
-    stats: as_tensor_format  # Normalization statistics
+    gradients: as_tensor_format  # Accumulated gradients 
+    grad_communication: fp32  # Gradient communication precision 
+    optimizer_states: as_tensor_format  # Optimizer states 
+    stats: as_tensor_format  # Normalization statistics 
     master_parameters: 0.0  # master weight copy in bytes (0 = disabled)
   h2d_bandwidth: -1  # Bytes/s; set -1 to disable H2D timing
   const_mem_offset: 0 GB # default 0 GB. We will optimize it later.
@@ -54,7 +53,7 @@ tech_param:
     util: 1
   SRAM-R:
     size: 27 MB
-    bandwidth: 122 TB
+    bandwidth: 122 TB     
     dynamic_energy_per_bit: 110e-15 # (J)
     latency: 0
     util: 1
@@ -74,38 +73,64 @@ memory_hierarchy:
     scope: global
 
 parallelism:
-  dp: 1 # data parallelism. Acts as replica count during inference
-  tp: 8 # tensor parallelism
-  tp_sp: false # tensor-sequence parallelism
-  cp: 2 # context parallelism. Not supported for inference.
-  lp: 4 # pipeline parallelism. Number of pipeline stages
+  tp: 2 # tensor parallelism
+  tp_sp: true # tensor-sequence parallelism
+  cp: 1 # context parallelism. Not supported for inference.
+  pp: 4 # pipeline parallelism. Number of pipeline stages
   # mb is not a true parallelism parameter, does not affect num of GPUs.
-  mb: 16 # micro-batches (for best results set to >= lp).
+  mb: 4 # micro-batches (for best results set to >= pp).
 
+  train:
+    dp: 2 # data parallelism
+    ep: 1 # expert parallelism
+    # controls expert TP sharding: if false, tp and ep are applied separately to attn/FFN; if true, TP applies to both
+    tp_ep: false
+  inference:
+    replica_count: 2 # inference throughput scaling only
+    moe_dp: 1 # inference expert pool expansion (EP_eff = tp * moe_dp)
 network:
   overlap:
-    tp_overlap: 0.0
-    tp_sp_overlap: 0.0
+    tp_overlap: 0.63
+    tp_sp_overlap: 0.63
     cp_overlap: 0.0
+  # Global faulty links apply to the active AstraSim dimension: [[src, dst, weight]]
+  # faulty_links: [[0,1,0.6],[16,17,0.1]]
   dimensions:
     - id: dim0
-      label: first_dim_2d
-      size: [8, 8]
+      label: torus2d_tp
+      size: auto
       topology:
-        type: Mesh2D
-        bandwidth: 20 GB
+        type: FC
+        bandwidth: 200 GB # We assume 8 25GB/s NVLINKs in the torus. Torus2D is hardcoded bidirectional, so it's actually 4 links, 25GB/s each (because they get replicated). So 100GB/s total. 
         latency: 5e-6
         energy_per_bit: 8e-12 # (J/bit)
         util: 1.0
         optimize_2dmap: false
       collective_override: {} # overrides execution_backend.collectives when provided
-      parallelisms: [tp, cp, lp]
+      parallelisms: [tp, ep, cp]
+    - id: dim1
+      label: inter_torus_infiniband
+      size: auto
+      topology:
+        type: SuperPOD
+        superpod_variant: h100
+        leaf_size: 32
+        leaf_switches_per_su: 8
+        spine_switches_per_su: 4
+        bandwidth:
+          - 100 GB
+          - 200 GB
+        latency: 5e-6 
+        energy_per_bit: 8e-12 # (J/bit)
+        util: 1.0
+      collective_override: {} # overrides execution_backend.collectives when provided
+      parallelisms: [pp,dp]
 
 execution_backend:
   model: astra # analytical | astra
   astra:
     backend: astra
-    mode: full_astrasim_flattened  # hybrid | full_astrasim_hierarchical | full_astrasim_flattened
+    mode: full_astrasim_hierarchical  # hybrid | full_astrasim_hierarchical | full_astrasim_flattened
     collectives:
       # Default collective algorithms. Per-dimension collective_override entries can override these.
       # Allowed values per op: auto | ring | direct | halvingDoubling | doubleBinaryTree | mesh | mesh2d | hypercube | torus2d
@@ -118,7 +143,7 @@ execution_backend:
       endpoint_delay: 5
       active_chunks_per_dimension: 32 # Higher value means significantly slower astrasim runtime, but more accurate especially for tensor parallelism
       preferred_dataset_splits: 4 # Should be same as active_chunks_per_dimension
-      collective_arbitration: last_resort
+      collective_arbitration: last_resort  
 
 inference:
   kvcache_type: hbm_only # Only supported mode for now.

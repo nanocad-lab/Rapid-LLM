@@ -1,3 +1,18 @@
+# Copyright 2026 NanoCad lab, UCLA
+# https://nanocad.ee.ucla.edu/
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import math
 from heapq import heappush, heappop
 import sys
@@ -130,18 +145,20 @@ class Graph:
         self,
         mode: str,
         dp: int,
-        lp: int,
+        pp: int,
         tp: int,
         cp: int,
         comp_times: Dict[str, Any],
         comm_metadata: Dict[str, Any],
         misc_metadata: Dict[str, Any],
+        ep: int = 1,
     ) -> None:
         self.mode = mode
         self.dp = int(dp)
-        self.lp = int(lp)
+        self.pp = int(pp)
         self.tp = int(tp)
         self.cp = int(cp)
+        self.ep = int(ep)
         self.comp_times = comp_times or {}
         self.comm_metadata = comm_metadata or {}
         self.misc_metadata = misc_metadata or {}
@@ -151,9 +168,10 @@ class Graph:
 
         self.num_batch = self.misc_metadata.get("num_batch", 0)
         self.num_layer = self.misc_metadata.get("num_layer", 0)
-        self.layer_per_device = self.num_layer / self.lp if self.lp else self.num_layer
+        self.layer_per_device = self.num_layer / self.pp if self.pp else self.num_layer
         self.dp_microbatch_mode = str(self.misc_metadata.get("dp_microbatch_mode", "every_mb")).lower()
         self.dp_zero_stage = int(self.misc_metadata.get("dp_zero_stage", 0) or 0)
+        self.moe_layer_mask = list(self.misc_metadata.get("moe_layer_mask", []) or [])
 
         self.transformer_cfg = self.comp_times.get("transformer", {})
         self.T_grad_transformer = self.comp_times.get("grad_transformer", 0.0)
@@ -165,7 +183,7 @@ class Graph:
         return float(value) if value is not None else default
 
     def _compute_layers_per_stage(self) -> List[int]:
-        stage_count = max(1, int(self.lp) if self.lp else 1)
+        stage_count = max(1, int(self.pp) if self.pp else 1)
         if self.num_layer <= 0:
             return [0 for _ in range(stage_count)]
         base = self.num_layer // stage_count
@@ -190,6 +208,13 @@ class Graph:
         if self.layer_to_stage:
             return self.layer_to_stage[layer_idx]
         return 0
+
+    def _is_moe_layer(self, layer_idx: int) -> bool:
+        if not self.moe_layer_mask:
+            return False
+        if layer_idx < 0 or layer_idx >= len(self.moe_layer_mask):
+            return False
+        return bool(self.moe_layer_mask[layer_idx])
 
     def create_comm_edge(self, name, op_id, comm_key, is_dp=False, local_hw_id=None):
         """Create a communication edge with optional local computation node.
@@ -274,6 +299,7 @@ class Graph:
                 "participants",
                 "is_cross_layer",
                 "local_hw_id",
+                "is_moe_layer",
             ):
                 if hasattr(source, attr):
                     setattr(target, attr, getattr(source, attr))
@@ -584,7 +610,7 @@ class Graph:
         Args:
             network_model: NetworkModel instance for collective timing
             interconnect_params: Dict with bandwidth/latency for each type
-                                {'dp': (ib, ll), 'lp': (ib, ll), 'tp': (ib, ll)}
+                                {'dp': (ib, ll), 'pp': (ib, ll), 'tp': (ib, ll)}
         """
         def traverse_and_convert(node, visited=None):
             if visited is None:
@@ -638,13 +664,16 @@ class Graph:
         linear_softmax_b_time = self._time("linear_softmax_b")
         transformer_f_time = self._time("transformer_f")
         transformer_b_time = self._time("transformer_b")
+        transformer_f_dense = self._time("transformer_f_dense", transformer_f_time)
+        transformer_f_moe = self._time("transformer_f_moe", transformer_f_time)
+        transformer_b_dense = self._time("transformer_b_dense", transformer_b_time)
+        transformer_b_moe = self._time("transformer_b_moe", transformer_b_time)
         embedding_f_time = self._time("embedding_f")
         embedding_b_time = self._time("embedding_b")
         cross_layer_time = self._time("cross_layer_f")
         recompute_enabled = include_backward and self.full_recomputation and (
             self.flattened_mode or self.pipeline_style_recompute
         )
-        transformer_b_base_time = transformer_b_time
 
 
         def attach_parallel_edge(target, gather_edge, skip_non_comm_children=None, skip_comm_children=None):
@@ -691,7 +720,7 @@ class Graph:
             linear_softmax = Node(
                 f"linear_softmax{b}",
                 op_id,
-                self.lp - 1,
+                self.pp - 1,
                 linear_softmax_f_time,
                 mem_kind=MemKind.SOFTMAX,
             )
@@ -714,17 +743,20 @@ class Graph:
 
             for l in range(self.num_layer):
                 hw_id = self._stage_for_layer(l)
+                is_moe_layer = self._is_moe_layer(l)
+                transformer_duration = transformer_f_moe if is_moe_layer else transformer_f_dense
                 transformer_node = Node(
                     f"transformer_layer{l}",
                     op_id,
                     hw_id,
-                    transformer_f_time,
+                    transformer_duration,
                     mem_kind=MemKind.TRANSFORMER,
                 )
                 transformer_node.micro_batch_index = b
                 transformer_node.layer_index = l
                 transformer_node.direction = "forward"
                 transformer_node.stage_id = hw_id
+                transformer_node.is_moe_layer = is_moe_layer
                 op_id += 1
                 transformer_nodes[b].append(transformer_node)
                 entry_nodes = [transformer_node]
@@ -821,7 +853,7 @@ class Graph:
             linear_softmax_b = Node(
                 "linear_softmax_b",
                 op_id,
-                self.lp - 1,
+                self.pp - 1,
                 linear_softmax_b_time,
                 fwd=False,
                 mem_kind=MemKind.SOFTMAX,
@@ -839,7 +871,7 @@ class Graph:
                         f"transformer_layer{l}_recompute",
                         op_id,
                         hw_id,
-                        transformer_f_time,
+                        transformer_f_moe if self._is_moe_layer(l) else transformer_f_dense,
                         fwd=True,
                         mem_kind=MemKind.TRANSFORMER,
                         recompute=True,
@@ -848,14 +880,16 @@ class Graph:
                     recompute_node.layer_index = l
                     recompute_node.direction = "forward"
                     recompute_node.stage_id = hw_id
+                    recompute_node.is_moe_layer = self._is_moe_layer(l)
                     op_id += 1
                     recompute_nodes_b[b][l] = recompute_node
 
+                is_moe_layer = self._is_moe_layer(l)
                 transformer_node_b = Node(
                     f"transformer_layer{l}_b",
                     op_id,
                     hw_id,
-                    transformer_b_base_time,
+                    transformer_b_moe if is_moe_layer else transformer_b_dense,
                     fwd=False,
                     mem_kind=MemKind.TRANSFORMER,
                 )
@@ -863,6 +897,7 @@ class Graph:
                 transformer_node_b.layer_index = l
                 transformer_node_b.direction = "backward"
                 transformer_node_b.stage_id = hw_id
+                transformer_node_b.is_moe_layer = is_moe_layer
                 op_id += 1
                 transformer_nodes_b[b][l] = transformer_node_b
                 if recompute_node is not None:
@@ -951,10 +986,11 @@ class Graph:
                 zero3_transformer_key = "zero3_transformer_gather"
                 zero3_softmax_key = "zero3_softmax_gather"
                 for layer_idx in range(self.num_layer):
+                    comm_key = "transformer_moe" if self._is_moe_layer(layer_idx) else "transformer_dense"
                     reducer = self.create_comm_edge(
                         f"transformer_b{b}_layer{layer_idx}"+postfix,
                         op_id,
-                        "transformer",
+                        comm_key,
                         is_dp=True,
                         local_hw_id=_bwd_exit_node(b, layer_idx).hw_id,
                     )
@@ -1053,31 +1089,52 @@ class Graph:
                 for layer_idx in range(self.num_layer):
                     _bwd_exit_node(b, layer_idx).add_child(R_edge[b][layer_idx + 1])
 
+            if self.ep > 1 and self.dp > 1:
+                apply_ep_all_mbs = self.dp_microbatch_mode != "last_mb" or self.dp_zero_stage >= 3
+                if apply_ep_all_mbs or b == 0:
+                    for layer_idx in range(self.num_layer):
+                        comm_key = (
+                            "transformer_moe_ep_sync"
+                            if self._is_moe_layer(layer_idx)
+                            else "transformer_dense_ep_sync"
+                        )
+                        if comm_key not in self.comm_metadata:
+                            continue
+                        ep_edge = self.create_comm_edge(
+                            f"{comm_key}_b{b}_layer{layer_idx}",
+                            op_id,
+                            comm_key,
+                            is_dp=False,
+                            local_hw_id=_bwd_exit_node(b, layer_idx).hw_id,
+                        )
+                        op_id += 1
+                        _bwd_exit_node(b, layer_idx).add_child(ep_edge)
 
-        last_transformer_layer = [-1] * self.lp  # Initialize with -1 for all GPUs
-        first_transformer_layer = [-1] * self.lp  # Initialize with -1 for all GPUs
+
+        last_transformer_layer = [-1] * self.pp  # Initialize with -1 for all GPUs
+        first_transformer_layer = [-1] * self.pp  # Initialize with -1 for all GPUs
 
         # first_transformer_layer.append(0)
-        gpu_index = self.lp - 1
+        gpu_index = self.pp - 1
         for l in range(self.num_layer - 1, 0, -1):
             if _bwd_exit_node(0, l).hw_id != _bwd_exit_node(0, l-1).hw_id:  # Check if on different GPU
                 # print("Layer ", l, " is on GPU ", _bwd_exit_node(0, l).hw_id)
                 first_transformer_layer[gpu_index-1] = l-1  # Record first layer on each GPU
                 last_transformer_layer[gpu_index] = l  # Record last layer on each GPU
                 gpu_index -= 1
-        # for id in range(self.lp):
+        # for id in range(self.pp):
             # print("GPU ", id, " first layer ", first_transformer_layer[id], " last layer ", last_transformer_layer[id])
 
 
 
         for b in range(self.num_batch-1, 0, -1):
-            gpu_index = self.lp - 1
+            gpu_index = self.pp - 1
             for l in range(self.num_layer - 1, 0, -1):
                 if _bwd_exit_node(b, l).hw_id != _bwd_exit_node(b, l-1).hw_id:  # Check if on different GPUs
                     # last_transformer_layer.append(l)  # Record last layer on each GPU
                     # first_transformer_layer.append(l-1)  # Record first layer on each GPU
                     
-                    if _bwd_exit_node(b, l).hw_id == self.lp - 1:
+                    if _bwd_exit_node(b, l).hw_id == self.pp - 1:
                         _bwd_exit_node(b, l).add_child(softmax_node_b[b-1])  # Add dependency edge
                     else:
                         _bwd_exit_node(b, l).add_child(_bwd_entry_node(b-1, first_transformer_layer[gpu_index]))  # Add dependency edge
@@ -1167,7 +1224,7 @@ class Graph:
                         stage_min_layer[stage] = min(stage_min_layer[stage], l)
                                 
                 # bwd flips mbs, so we attach to first one, not last.
-                for stage in range(self.lp):
+                for stage in range(self.pp):
                     last_node = None
                     if stage == 0:
                         last_node = embedding_node_b[0]
@@ -1198,98 +1255,155 @@ class Graph:
 
         tp_degree = max(1, int(self.tp))
         cp_degree = max(1, int(self.cp))
+        ep_degree = max(1, int(self.ep))
 
         root = Data_batch("transformer_root", 0, 0)
         op_id = 0
 
-        for cp_idx in range(cp_degree):
-            for tp_idx in range(tp_degree):
-                rank = tp_idx + cp_idx * tp_degree
-                previous = root
+        def _split_comm_keys(comm_keys: Optional[List[str]]) -> Tuple[List[str], List[str]]:
+            pre_keys: List[str] = []
+            post_keys: List[str] = []
+            if not comm_keys:
+                return pre_keys, post_keys
+            for key in comm_keys:
+                placement = self.comm_metadata.get(key, {}).get("placement", "post")
+                if placement == "pre":
+                    pre_keys.append(key)
+                elif placement == "post":
+                    post_keys.append(key)
+                else:
+                    raise ValueError(
+                        f"Unsupported comm placement '{placement}' for key '{key}' "
+                        "(expected 'pre' or 'post')"
+                    )
+            return pre_keys, post_keys
 
-                if direction in {"forward", "both"}:
-                    for idx, entry in enumerate(gemm_entries):
-                        entry_name = entry.get("name", f"g{idx}")
-                        forward_cfg = entry.get("forward", {})
-                        fwd_duration = forward_cfg.get("duration")
-                        if fwd_duration is None:
-                            raise ValueError("Transformer GEMM entry missing forward duration")
+        for ep_idx in range(ep_degree):
+            for cp_idx in range(cp_degree):
+                for tp_idx in range(tp_degree):
+                    rank = tp_idx + cp_idx * tp_degree + ep_idx * tp_degree * cp_degree
+                    previous = root
 
-                        node = Node(
-                            name=f"{entry_name}_fwd_rank{rank}",
-                            op_id=op_id,
-                            hw_id=rank,
-                            duration=fwd_duration,
-                            fwd=True,
-                            mem_kind=mem_kind_from_op_name(entry_name),
-                            param_gather=(idx == 0),
-                        )
-                        node.tp_rank = tp_idx
-                        node.cp_rank = cp_idx
-                        op_id += 1
-                        previous.add_child(node)
-                        previous = node
-                        comm_key = forward_cfg.get("comm_keys", None)
-                        if comm_key:
-                            if len(comm_key) > 1:
-                                print(f"*CONSTRUCT INFO: Multiple comm keys for {entry_name}")
-                                print(f"*CONSTRUCT INFO: Comm keys: {comm_key}")
-                                raise ValueError(f"Multiple comm keys for {entry_name}")
+                    if direction in {"forward", "both"}:
+                        for idx, entry in enumerate(gemm_entries):
+                            entry_name = entry.get("name", f"g{idx}")
+                            forward_cfg = entry.get("forward", {})
+                            fwd_duration = forward_cfg.get("duration")
+                            if fwd_duration is None:
+                                raise ValueError("Transformer GEMM entry missing forward duration")
 
-                            comm_key = comm_key[0]
-                            if comm_key not in self.comm_metadata:
-                                raise KeyError(f"Missing transformer comm metadata for key '{comm_key}'")
-                            comm_edge = self.create_comm_edge(
-                                name=comm_key,
+                            comm_keys = list(forward_cfg.get("comm_keys", []) or [])
+                            pre_keys, post_keys = _split_comm_keys(comm_keys)
+
+                            for comm_key in pre_keys:
+                                if comm_key not in self.comm_metadata:
+                                    raise KeyError(f"Missing transformer comm metadata for key '{comm_key}'")
+                                comm_edge = self.create_comm_edge(
+                                    name=comm_key,
+                                    op_id=op_id,
+                                    comm_key=comm_key,
+                                    is_dp=False,
+                                    local_hw_id=rank,
+                                )
+                                comm_edge.tp_rank = tp_idx
+                                comm_edge.cp_rank = cp_idx
+                                comm_edge.ep_rank = ep_idx
+                                op_id += 1
+                                previous.add_child(comm_edge)
+                                previous = comm_edge
+
+                            node = Node(
+                                name=f"{entry_name}_fwd_rank{rank}",
                                 op_id=op_id,
-                                comm_key=comm_key,
-                                is_dp=False,
-                                local_hw_id=rank,
+                                hw_id=rank,
+                                duration=fwd_duration,
+                                fwd=True,
+                                mem_kind=mem_kind_from_op_name(entry_name),
+                                param_gather=(idx == 0),
                             )
-                            comm_edge.tp_rank = tp_idx
-                            comm_edge.cp_rank = cp_idx
+                            node.tp_rank = tp_idx
+                            node.cp_rank = cp_idx
+                            node.ep_rank = ep_idx
                             op_id += 1
-                            previous.add_child(comm_edge)
-                            previous = comm_edge
+                            previous.add_child(node)
+                            previous = node
+                            for comm_key in post_keys:
+                                if comm_key not in self.comm_metadata:
+                                    raise KeyError(f"Missing transformer comm metadata for key '{comm_key}'")
+                                comm_edge = self.create_comm_edge(
+                                    name=comm_key,
+                                    op_id=op_id,
+                                    comm_key=comm_key,
+                                    is_dp=False,
+                                    local_hw_id=rank,
+                                )
+                                comm_edge.tp_rank = tp_idx
+                                comm_edge.cp_rank = cp_idx
+                                comm_edge.ep_rank = ep_idx
+                                op_id += 1
+                                previous.add_child(comm_edge)
+                                previous = comm_edge
 
-                if direction in {"backward", "both"}:
-                    for idx, entry in enumerate(reversed(gemm_entries)):
-                        entry_name = entry.get("name", f"g{idx}")
-                        backward_cfg = entry.get("backward", {})
-                        bwd_duration = backward_cfg.get("duration")
-                        if bwd_duration is None:
-                            raise ValueError("Transformer GEMM entry missing backward duration")
+                    if direction in {"backward", "both"}:
+                        for idx, entry in enumerate(reversed(gemm_entries)):
+                            entry_name = entry.get("name", f"g{idx}")
+                            backward_cfg = entry.get("backward", {})
+                            bwd_duration = backward_cfg.get("duration")
+                            if bwd_duration is None:
+                                raise ValueError("Transformer GEMM entry missing backward duration")
 
-                        node = Node(
-                            name=f"{entry_name}_bwd_rank{rank}",
-                            op_id=op_id,
-                            hw_id=rank,
-                            duration=bwd_duration,
-                            fwd=False,
-                            mem_kind=mem_kind_from_op_name(entry_name),
-                            param_gather=(idx == 0),
-                        )
-                        node.tp_rank = tp_idx
-                        node.cp_rank = cp_idx
-                        op_id += 1
-                        previous.add_child(node)
-                        previous = node
+                            comm_keys = list(backward_cfg.get("comm_keys", []) or [])
+                            pre_keys, post_keys = _split_comm_keys(comm_keys)
 
-                        for comm_idx, comm_key in enumerate(backward_cfg.get("comm_keys", [])):
-                            if comm_key not in self.comm_metadata:
-                                raise KeyError(f"Missing transformer comm metadata for key '{comm_key}'")
-                            comm_edge = self.create_comm_edge(
-                                name=comm_key,
+                            for comm_key in pre_keys:
+                                if comm_key not in self.comm_metadata:
+                                    raise KeyError(f"Missing transformer comm metadata for key '{comm_key}'")
+                                comm_edge = self.create_comm_edge(
+                                    name=comm_key,
+                                    op_id=op_id,
+                                    comm_key=comm_key,
+                                    is_dp=False,
+                                    local_hw_id=rank,
+                                )
+                                comm_edge.tp_rank = tp_idx
+                                comm_edge.cp_rank = cp_idx
+                                comm_edge.ep_rank = ep_idx
+                                op_id += 1
+                                previous.add_child(comm_edge)
+                                previous = comm_edge
+
+                            node = Node(
+                                name=f"{entry_name}_bwd_rank{rank}",
                                 op_id=op_id,
-                                comm_key=comm_key,
-                                is_dp=False,
-                                local_hw_id=rank,
+                                hw_id=rank,
+                                duration=bwd_duration,
+                                fwd=False,
+                                mem_kind=mem_kind_from_op_name(entry_name),
+                                param_gather=(idx == 0),
                             )
-                            comm_edge.tp_rank = tp_idx
-                            comm_edge.cp_rank = cp_idx
+                            node.tp_rank = tp_idx
+                            node.cp_rank = cp_idx
+                            node.ep_rank = ep_idx
                             op_id += 1
-                            previous.add_child(comm_edge)
-                            previous = comm_edge
+                            previous.add_child(node)
+                            previous = node
+
+                            for comm_idx, comm_key in enumerate(post_keys):
+                                if comm_key not in self.comm_metadata:
+                                    raise KeyError(f"Missing transformer comm metadata for key '{comm_key}'")
+                                comm_edge = self.create_comm_edge(
+                                    name=comm_key,
+                                    op_id=op_id,
+                                    comm_key=comm_key,
+                                    is_dp=False,
+                                    local_hw_id=rank,
+                                )
+                                comm_edge.tp_rank = tp_idx
+                                comm_edge.cp_rank = cp_idx
+                                comm_edge.ep_rank = ep_idx
+                                op_id += 1
+                                previous.add_child(comm_edge)
+                                previous = comm_edge
 
         return root
         
@@ -1304,7 +1418,7 @@ class Graph:
         ready_list.append(root)
         root.scheduled = True
         ###find number of devices needed
-        base_devices = max(1, int(self.lp) if self.lp else 1)
+        base_devices = max(1, int(self.pp) if self.pp else 1)
         max_hw_id = -1
         visited_nodes: Set[int] = set()
         stack = list(root if isinstance(root, (list, tuple)) else [root])
@@ -1419,7 +1533,7 @@ class Graph:
         ready_list.append(root)
         root.scheduled = True
         ###find number of devices needed
-        base_devices = max(1, int(self.lp) if self.lp else 1)
+        base_devices = max(1, int(self.pp) if self.pp else 1)
         max_hw_id = -1
         visited_nodes: Set[int] = set()
         stack = list(root if isinstance(root, (list, tuple)) else [root])
@@ -1601,6 +1715,10 @@ class Graph:
 
         persistent_by_kind = memory_data.get("persistent_bytes_by_kind", {}) or {}
         transient_by_kind = memory_data.get("transient_bytes_by_kind", {}) or {}
+        persistent_by_kind_dense = memory_data.get("persistent_bytes_by_kind_dense", persistent_by_kind) or {}
+        persistent_by_kind_moe = memory_data.get("persistent_bytes_by_kind_moe", persistent_by_kind_dense) or {}
+        transient_by_kind_dense = memory_data.get("transient_bytes_by_kind_dense", transient_by_kind) or {}
+        transient_by_kind_moe = memory_data.get("transient_bytes_by_kind_moe", transient_by_kind_dense) or {}
         valid_kinds = set(persistent_by_kind) | set(transient_by_kind)
         param_gather_bytes = float(memory_data.get("param_gather_bytes", 0.0) or 0.0)
 
@@ -1628,14 +1746,17 @@ class Graph:
 
         def _persistent_bytes_for_node(node: Any) -> float:
             mem_kind = _node_mem_kind(node)
-            return _bytes_for_kind(mem_kind, persistent_by_kind, "persistent")
+            mapping = persistent_by_kind_moe if getattr(node, "is_moe_layer", False) and _is_transformer_block(node) else persistent_by_kind_dense
+            return _bytes_for_kind(mem_kind, mapping, "persistent")
 
         def _transient_bytes_for_node(node: Any) -> float:
             mem_kind = _node_mem_kind(node)
-            return _bytes_for_kind(mem_kind, transient_by_kind, "transient")
+            mapping = transient_by_kind_moe if getattr(node, "is_moe_layer", False) and _is_transformer_block(node) else transient_by_kind_dense
+            return _bytes_for_kind(mem_kind, mapping, "transient")
 
-        def _count_transformer_layers_per_device(root_obj: Any, num_devices: int) -> List[int]:
-            layer_sets: List[Set[Any]] = [set() for _ in range(num_devices)]
+        def _count_transformer_layers_per_device(root_obj: Any, num_devices: int) -> Tuple[List[int], List[int]]:
+            dense_sets: List[Set[Any]] = [set() for _ in range(num_devices)]
+            moe_sets: List[Set[Any]] = [set() for _ in range(num_devices)]
             stack_local = list(root_obj if isinstance(root_obj, (list, tuple)) else [root_obj])
             visited_local: Set[int] = set()
             while stack_local:
@@ -1655,23 +1776,31 @@ class Graph:
                         and _is_transformer_block(current)
                         and getattr(current, "fwd", True)
                     ):
-                        layer_sets[hw_id].add(layer_idx)
+                        if getattr(current, "is_moe_layer", False):
+                            moe_sets[hw_id].add(layer_idx)
+                        else:
+                            dense_sets[hw_id].add(layer_idx)
 
                 stack_local.extend(getattr(current, "children", []))
-            return [len(layer_set) for layer_set in layer_sets]
+            return ([len(layer_set) for layer_set in dense_sets], [len(layer_set) for layer_set in moe_sets])
 
         memory_output_dir: Optional[str] = None
         if output_folder:
             memory_output_dir = os.path.join(output_folder, "memory-summary")
 
-        transformer_layers_per_device = _count_transformer_layers_per_device(root, base_devices)
+        transformer_dense_layers_per_device, transformer_moe_layers_per_device = _count_transformer_layers_per_device(root, base_devices)
         static_mem_per_layer = memory_data.get("static_mem_per_layer", 0)
+        static_mem_per_layer_dense = memory_data.get("static_mem_per_layer_dense", static_mem_per_layer)
+        static_mem_per_layer_moe = memory_data.get("static_mem_per_layer_moe", static_mem_per_layer_dense)
         weight_mem_per_layer = memory_data.get("weight_mem_per_layer", 0)
+        weight_mem_per_layer_dense = memory_data.get("weight_mem_per_layer_dense", weight_mem_per_layer)
+        weight_mem_per_layer_moe = memory_data.get("weight_mem_per_layer_moe", weight_mem_per_layer_dense)
         kv_cache_bytes_per_layer = memory_data.get("kv_cache_bytes_per_layer", 0.0)
         extra_static_bytes_per_device = memory_data.get("extra_static_bytes_per_device", {}) or {}
-        total_tracked_layers = sum(transformer_layers_per_device)
+        total_tracked_layers = sum(transformer_dense_layers_per_device) + sum(transformer_moe_layers_per_device)
         if total_tracked_layers == 0:
-            transformer_layers_per_device = [1 for _ in range(base_devices)]
+            transformer_dense_layers_per_device = [1 for _ in range(base_devices)]
+            transformer_moe_layers_per_device = [0 for _ in range(base_devices)]
 
         GPU_list = [True for _ in range(base_devices)]
         data_list = [False for _ in range(0, self.num_batch)]
@@ -1680,13 +1809,23 @@ class Graph:
         for idx in range(base_devices):
             
             if mode == "inference":
-                layer_count = transformer_layers_per_device[idx] if idx < len(transformer_layers_per_device) else 1
-                static_bytes = weight_mem_per_layer * layer_count
+                dense_count = transformer_dense_layers_per_device[idx] if idx < len(transformer_dense_layers_per_device) else 0
+                moe_count = transformer_moe_layers_per_device[idx] if idx < len(transformer_moe_layers_per_device) else 0
+                layer_count = dense_count + moe_count
+                if layer_count == 0:
+                    dense_count = 1
+                    layer_count = 1
+                static_bytes = (weight_mem_per_layer_dense * dense_count) + (weight_mem_per_layer_moe * moe_count)
                 if kv_cache_bytes_per_layer:
                     static_bytes += kv_cache_bytes_per_layer * layer_count
             elif mode == "training":
-                layer_count = transformer_layers_per_device[idx] if idx < len(transformer_layers_per_device) else 1
-                static_bytes = static_mem_per_layer * layer_count
+                dense_count = transformer_dense_layers_per_device[idx] if idx < len(transformer_dense_layers_per_device) else 0
+                moe_count = transformer_moe_layers_per_device[idx] if idx < len(transformer_moe_layers_per_device) else 0
+                layer_count = dense_count + moe_count
+                if layer_count == 0:
+                    dense_count = 1
+                    layer_count = 1
+                static_bytes = (static_mem_per_layer_dense * dense_count) + (static_mem_per_layer_moe * moe_count)
             else:
                 raise ValueError(f"Invalid mode '{mode}' for memory simulation")
             static_bytes += extra_static_bytes_per_device.get(idx, 0.0)

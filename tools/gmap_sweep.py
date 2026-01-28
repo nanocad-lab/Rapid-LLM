@@ -1,9 +1,24 @@
 #!/usr/bin/env python3
+# Copyright 2026 NanoCad lab, UCLA
+# https://nanocad.ee.ucla.edu/
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 GMap sweep utility.
 
 This tool explores tensor/context/pipeline parallelism combinations that live in
-the first network dimension (TP/CP/LP) for a square, power-of-two GPU count.
+the first network dimension (TP/CP/PP) for a square, power-of-two GPU count.
 Each configuration is evaluated by running RAPID-LLM with the
 RAPID_GMAP_ONLY=1 environment variable so execution stops immediately after
 SCOTCH emits the mapping artefacts.  The script parses the resulting
@@ -55,7 +70,7 @@ TOPOLOGY_VARIANTS = ("Mesh2D", "Torus2D")
 # Hard bounds (inclusive) on each parallelism axis.
 TP_BOUNDS = (1, 128)
 CP_BOUNDS = (1, 128)
-LP_BOUNDS = (1, 128)
+PP_BOUNDS = (1, 128)
 
 # -----------------------------------------------------------------------------#
 # Helpers lifted / adapted from existing sweep tools                           #
@@ -84,7 +99,17 @@ def make_temp_hw_config(
     updated = copy.deepcopy(base_hw_dict)
     parallel_block = updated.setdefault("parallelism", {})
     for key, value in parallel_settings.items():
-        parallel_block[key] = int(value)
+        if key in {"tp", "cp", "pp", "mb", "tp_sp"}:
+            parallel_block[key] = int(value)
+
+    train_block = parallel_block.setdefault("train", {})
+    train_block["dp"] = int(parallel_settings.get("dp", train_block.get("dp", 1)) or 1)
+    train_block.setdefault("ep", 1)
+    train_block.setdefault("tp_ep", True)
+
+    inference_block = parallel_block.setdefault("inference", {})
+    inference_block.setdefault("replica_count", 1)
+    inference_block.setdefault("moe_dp", 1)
 
     if hw_mutator:
         hw_mutator(updated)
@@ -138,17 +163,17 @@ def enumerate_parallelisms(num_gpus: int) -> List[Dict[str, int]]:
 
     tp_min, tp_max = TP_BOUNDS
     cp_min, cp_max = CP_BOUNDS
-    lp_min, lp_max = LP_BOUNDS
+    pp_min, pp_max = PP_BOUNDS
     tp_values = _powers_of_two_between(tp_min, min(tp_max, limit))
     cp_values = _powers_of_two_between(cp_min, min(cp_max, limit))
-    lp_values = _powers_of_two_between(lp_min, min(lp_max, limit))
+    pp_values = _powers_of_two_between(pp_min, min(pp_max, limit))
     combos: List[Dict[str, int]] = []
     for tp in tp_values:
         for cp in cp_values:
-            for lp in lp_values:
-                if tp * cp * lp == num_gpus:
-                    combos.append({"tp": tp, "cp": cp, "lp": lp})
-    combos.sort(key=lambda item: (item["tp"], item["cp"], item["lp"]))
+            for pp in pp_values:
+                if tp * cp * pp == num_gpus:
+                    combos.append({"tp": tp, "cp": cp, "pp": pp})
+    combos.sort(key=lambda item: (item["tp"], item["cp"], item["pp"]))
     return combos
 
 
@@ -252,11 +277,11 @@ def run_single_configuration(
     if keep_artifacts:
         base_dir = os.path.join("tools", "gmap_artifacts")
         os.makedirs(base_dir, exist_ok=True)
-        dir_name = "gmap_{topology}_tp{tp}_cp{cp}_lp{lp}".format(
+        dir_name = "gmap_{topology}_tp{tp}_cp{cp}_pp{pp}".format(
             topology=topology.lower(),
             tp=parallel_settings["tp"],
             cp=parallel_settings["cp"],
-            lp=parallel_settings["lp"],
+            pp=parallel_settings["pp"],
         )
         temp_dir = os.path.join(base_dir, dir_name)
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -392,10 +417,10 @@ def plot_results(results: Sequence[Dict[str, object]], num_gpus: int, topology: 
         dtype=float,
     )
     labels = [
-        "tp={tp}, cp={cp}, lp={lp}".format(
+        "tp={tp}, cp={cp}, pp={pp}".format(
             tp=entry["parallelism"]["tp"],
             cp=entry["parallelism"]["cp"],
-            lp=entry["parallelism"]["lp"],
+            pp=entry["parallelism"]["pp"],
         )
         for entry in results
     ]
@@ -427,7 +452,7 @@ def write_report(results: Sequence[Dict[str, object]], path: str, topology: str)
     header = [
         "tp",
         "cp",
-        "lp",
+        "pp",
         "before_commexpan",
         "after_commexpan",
         "delta_percent",
@@ -442,7 +467,7 @@ def write_report(results: Sequence[Dict[str, object]], path: str, topology: str)
             row = [
                 str(parallelism["tp"]),
                 str(parallelism["cp"]),
-                str(parallelism["lp"]),
+                str(parallelism["pp"]),
                 _format_float(entry.get("before")),
                 _format_float(entry.get("after")),
                 _format_delta(entry.get("delta_pct")),
@@ -460,7 +485,7 @@ def write_report(results: Sequence[Dict[str, object]], path: str, topology: str)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Sweep TP/CP/LP combinations for GMap cost deltas.")
+    parser = argparse.ArgumentParser(description="Sweep TP/CP/PP combinations for GMap cost deltas.")
     parser.add_argument("--hardware-config", default="configs/hardware-config/gmap_mesh2d_demo.yaml", help="Base hardware config path.")
     parser.add_argument("--model-config", default="configs/model-config/Llama3.1-405B.yaml", help="Model config path.")
     parser.add_argument("--max-workers", type=int, default=None, help="Maximum concurrent worker processes.")
@@ -485,7 +510,7 @@ def main():
     mode = determine_model_mode(args.model_config)
     cases = enumerate_parallelisms(num_gpus)
     if not cases:
-        print("No TP/CP/LP combinations satisfy the constraints.")
+        print("No TP/CP/PP combinations satisfy the constraints.")
         return
     print(f"Evaluating {len(cases)} configuration(s) for num_gpus={num_gpus}")
 
@@ -556,7 +581,7 @@ def main():
         if not results:
             print("No successful evaluations for this topology; skipping.")
             continue
-        results.sort(key=lambda entry: (entry["parallelism"]["tp"], entry["parallelism"]["cp"], entry["parallelism"]["lp"]))
+        results.sort(key=lambda entry: (entry["parallelism"]["tp"], entry["parallelism"]["cp"], entry["parallelism"]["pp"]))
         best = min(
             (entry for entry in results if entry.get("delta_pct") == entry.get("delta_pct")),
             key=lambda e: e.get("delta_pct"),
@@ -565,10 +590,10 @@ def main():
         if best:
             best_delta = best.get("delta_pct")
             print(
-                "Best improvement: tp={tp}, cp={cp}, lp={lp}, Δ={delta}".format(
+                "Best improvement: tp={tp}, cp={cp}, pp={pp}, Δ={delta}".format(
                     tp=best["parallelism"]["tp"],
                     cp=best["parallelism"]["cp"],
-                    lp=best["parallelism"]["lp"],
+                    pp=best["parallelism"]["pp"],
                     delta=_format_delta(best_delta),
                 )
             )

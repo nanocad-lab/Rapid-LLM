@@ -1,0 +1,175 @@
+sw_param:
+  full_recomputation: false # Enable full activation recompute during backward instead of selective recomputation
+  kernel_launch_overhead: 9e-6   # (s)
+  # dp_zero_stage selects ZeRO-style data-parallel sharding: 0=DDP, 1=ZeRO-1, 2=ZeRO-2, 3=ZeRO-3
+  # only used if data parallelism (dp) > 1
+  dp_zero_stage: 1
+  precision:
+    # tensor_format accepts numeric byte counts or dtype strings (fp16, bf16, fp32).
+    # Take care that the number of flops defined below has been carefully tuned for FP16/BF16 formats.
+    # For FP32 or other formats they need to be manually adjusted.
+    # The following are equivalent: (tensor_format: 2.0, tensor_format: fp16, tensor_format: bf16).
+    tensor_format: bf16  # baseline storage width for activations/gradients.
+    # kv_cache precision may be set as bytes, dtype string, or "as_tensor_format".
+    kv_cache: as_tensor_format
+    # Model parameter precision
+    parameters: as_tensor_format
+    # Accumulated gradients (persistent FP32 buffer)
+    gradients: as_tensor_format
+    # Ephemeral per-microbatch gradients
+    grad_microbatch: as_tensor_format
+    # Gradient communication precision
+    grad_communication: as_tensor_format
+    # Optimizer states (momentum, variance)
+    optimizer_states: as_tensor_format
+    # Training statistics
+    stats: as_tensor_format
+    # FP32 master weight copy (0 = disabled)
+    master_parameters: 0.0
+  h2d_bandwidth: -1  # Bytes/s; set -1 to disable H2D timing
+  # DP gradient sync frequency: every_mb (default) or last_mb (sync only on final microbatch; ZeRO-3 stays per-mb)
+  dp_microbatch: last_mb
+tech_param:
+  core:
+    operating_frequency: 1.41e9     # (Hz)
+    num_bundles: 108
+    nominal_flop_rate_per_mcu: 512
+    nominal_energy_per_flop: 1.8e-13 # (J)
+    num_mcu_per_bundle: 4     # number of tensorcores per SM
+    FMA_d1: 8                 # tensor core can compute the results for an d1 x d2 x d1 mixed-precision matrix multiplication per clock
+    FMA_d2: 4
+    dataflow: best            # {wst | ast | ost | best}: wst: weight stationary, ast: activation stationary, ost: output stationary, best: best of all 3
+    util: 0.85
+  DRAM:
+    size: 80 GB
+    bandwidth: 1986 GB     # (/s)
+    dynamic_energy_per_bit: 4.5e-12     # (J)
+    latency: 100e-9     # (s)
+    util: 0.5
+  SRAM-L2:
+    size: 40 MB
+    bandwidth: 7050 GB
+    dynamic_energy_per_bit: 130e-15 # (J)
+    latency: 0
+    util: 1
+  SRAM-L1:
+    size: 20736 KB
+    bandwidth: 18 TB
+    dynamic_energy_per_bit: 130e-15 # (J)
+    latency: 0
+    util: 1
+  SRAM-R:
+    size: 27 MB
+    bandwidth: 122 TB     
+    dynamic_energy_per_bit: 110e-15 # (J)
+    latency: 0
+    util: 1
+
+memory_hierarchy:
+  l0:   #Register Memory
+    type: SRAM-R
+    scope: mcu
+  l1:   #Shared Memory
+    type: SRAM-L1
+    scope: mcu-bundle
+  l2:   #L2
+    type: SRAM-L2
+    scope: global
+  l3:   #Global Memory
+    type: DRAM
+    scope: global
+
+parallelism:
+  tp: 2 # tensor parallelism
+  tp_sp: false # tensor-sequence parallelism
+  cp: 2 # context parallelism. Not supported for inference.
+  pp: 4 # pipeline parallelism. Number of pipeline stages
+  # mb is not a true parallelism parameter, does not affect num of GPUs.
+  mb: 1 # micro-batches (for best results set to >= pp). 
+
+  train:
+    dp: 2 # data parallelism
+    ep: 1 # expert parallelism
+    # controls expert TP sharding: if false, tp and ep are applied separately to attn/FFN; if true, TP applies to both
+    tp_ep: true
+  inference:
+    replica_count: 2 # inference throughput scaling only
+    moe_dp: 1 # inference expert pool expansion (EP_eff = tp * moe_dp)
+network:
+  # Global faulty links apply to the active AstraSim dimension: [[src, dst, weight]]
+  # faulty_links: [[0,1,0.6],[16,17,0.1]]
+  dimensions:
+    - id: dim0
+      label: torus2d_tp
+      size: auto
+      topology:
+        type: FullyConnected
+        bandwidth: 250 GB # We assume 8 25GB/s NVLINKs in the torus. Torus2D is hardcoded bidirectional, so it's actually 4 links, 25GB/s each (because they get replicated). So 100GB/s total. 
+        latency: 5e-6
+        energy_per_bit: 8e-12 # (J/bit)
+        util: 1
+        optimize_2dmap: false
+      collective_override: {} # overrides execution_backend.collectives when provided
+      parallelisms: [tp, cp, ep]
+
+    - id: dim1
+      label: inter_torus_infiniband
+      size: auto
+      topology:
+        type: SuperPOD
+        superpod_variant: h100
+        leaf_size: 30
+        leaf_switches_per_su: 8
+        spine_switches_per_su: 4
+        bandwidth:
+          - 25 GB
+          - 50 GB
+        latency: 5e-6 
+        energy_per_bit: 8e-12 # (J/bit)
+        util: 3
+      # collective_override: {} # overrides execution_backend.collectives when provided
+      collective_override:
+        all_gather: direct
+        all_reduce: direct
+        reduce_scatter: direct
+        all_to_all: direct
+      parallelisms: [pp,dp]
+    - id: dim2
+      label: inter_torus_infiniband_dp
+      size: auto
+      topology:
+        type: Ring
+        bandwidth: 25 GB
+        latency: 5e-6
+        energy_per_bit: 8e-12 # (J/bit)
+        util: 1.0
+      parallelisms: []
+      collective_override: {} # overrides execution_backend.collectives when provided
+
+  overlap:
+    # fraction of TP+SP compute that can overlap TP/SP comm
+    tp_sp_overlap: 0.63
+    # fraction of TP compute that can overlap TP comm
+    tp_overlap: 0.6
+    # fraction of CP comm that can overlap CP compute
+    cp_overlap: 0.0
+execution_backend:
+  model: astra # analytical | astra
+  astra:
+    backend: astra
+    mode: full_astrasim_hierarchical  # hybrid | full_astrasim_hierarchical | full_astrasim_flattened
+    collectives:
+      # Default collective algorithms. Per-dimension collective_override entries can override these.
+      # Allowed values per op: auto | ring | direct | halvingDoubling | doubleBinaryTree | mesh | mesh2d | hypercube | torus2d
+      # Note: leave to auto unless you have a specific reason to change it.
+      all_gather: auto
+      all_reduce: auto
+      reduce_scatter: auto
+      all_to_all: auto
+    sys_options:
+      endpoint_delay: 5
+      active_chunks_per_dimension: 8 # Higher value means significantly slower astrasim runtime, but more accurate especially for tensor parallelism
+      preferred_dataset_splits: 4 # Should be same as active_chunks_per_dimension
+
+inference:
+  kvcache_type: hbm_only # Only supported mode for now.

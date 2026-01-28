@@ -88,14 +88,21 @@ memory_hierarchy:
 parallelism:
   auto: false
   ### LLM PARAMS ###
-  dp: 1 # data parallelism. Acts as replica count during inference
   tp: 8 # tensor parallelism
   tp_sp: false # tensor-sequence parallelism
   cp: 1 # context parallelism. Not supported for inference.
-  lp: 1 # pipeline parallelism. Number of pipeline stages
+  pp: 1 # pipeline parallelism. Number of pipeline stages
   # mb is not a true parallelism parameter, does not affect num of GPUs.
-  mb: 1 # micro-batches (for best results set to >= lp). 
+  mb: 1 # micro-batches (for best results set to >= pp). 
 
+  train:
+    dp: 1 # data parallelism
+    ep: 1 # expert parallelism
+    # controls expert TP sharding: if false, tp and ep are applied separately to attn/FFN; if true, TP applies to both
+    tp_ep: true
+  inference:
+    replica_count: 1 # inference throughput scaling only
+    moe_dp: 1 # inference expert pool expansion (EP_eff = tp * moe_dp)
 network:
   dimensions:
     - id: dim0
@@ -120,7 +127,7 @@ network:
         energy_per_bit: 8e-12 # (J/bit)
         util: 1.0
       collective_override: {} # overrides execution_backend.collectives when provided
-      parallelisms: [lp,dp]
+      parallelisms: [pp,dp]
     - id: dim2
       label: inter_torus_infiniband_dp
       size: auto

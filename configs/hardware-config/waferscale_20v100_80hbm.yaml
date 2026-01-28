@@ -104,13 +104,20 @@ memory_hierarchy:
 
 parallelism:
   auto: false
-  dp: 1
-  lp: 1
+  pp: 1
   mb: 1
   tp: 20
   tp_sp: false
   cp: 1
 
+  train:
+    dp: 1 # data parallelism
+    ep: 1 # expert parallelism
+    # controls expert TP sharding: if false, tp and ep are applied separately to attn/FFN; if true, TP applies to both
+    tp_ep: true
+  inference:
+    replica_count: 1 # inference throughput scaling only
+    moe_dp: 1 # inference expert pool expansion (EP_eff = tp * moe_dp)
 network:
   dimensions:
     - id: dim0
@@ -123,7 +130,7 @@ network:
         energy_per_bit: 8e-12 # (J/bit)
         util: 0.95
       collective_override: {} # overrides execution_backend.collectives when provided
-      parallelisms: [tp, cp, lp, dp]
+      parallelisms: [tp, cp, ep, pp, dp]
 
   overlap:
     # fraction of TP+SP compute that can overlap TP/SP comm

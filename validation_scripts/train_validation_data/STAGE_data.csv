@@ -1,0 +1,5 @@
+label,tool,status,wall_seconds,cpu_seconds,tool_seconds,error,model,batch,mb,dp,tp,pp,cp,tp_sp,recomputation,case,actual_time_s
+GPT 310B bs=2160/mb=144 dp=15 tp=8 pp=16 cp=1 tp_sp=False recompute=full,STAGE,ok,14241.147386983037,13166.088819999999,6.157159473,,GPT 310B,2160,144,15,8,16,1,False,full,selene,34.1
+GPT 1T bs=3072/mb=512 dp=6 tp=8 pp=64 cp=1 tp_sp=False recompute=full,STAGE,ok,40663.097964871675,36826.182177999995,18.462227151,,GPT 1T,3072,512,6,8,64,1,False,full,selene,100.7
+GPT 175B bs=64/mb=64 dp=1 tp=8 pp=8 cp=1 tp_sp=False recompute=full,STAGE,ok,1528.4006929434836,1437.143515,8.130442747,,GPT 175B,64,64,1,8,8,1,False,full,korthi,16.9
+GPT 1T bs=512/mb=512 dp=1 tp=8 pp=64 cp=1 tp_sp=False recompute=full,STAGE,ok,17286.06181443855,17151.439544,18.243547948,,GPT 1T,512,512,1,8,64,1,False,full,korthi,87.9

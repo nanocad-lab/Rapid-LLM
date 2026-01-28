@@ -13,8 +13,13 @@ model_param:
     kv_heads: 64
     use_flashattention: false
     attention_tile_size: 128
-  num_experts: 1
-  top_k: 1
+  moe:
+    num_experts: 1
+    top_k: 1
+    moe_intermediate_size: 24576
+    n_shared_experts: 0
+    moe_layer_freq: 1
+    first_k_dense_replace: 48
   intermediate_size: 24576
   vocab_size: 51200
   num_layers: 48

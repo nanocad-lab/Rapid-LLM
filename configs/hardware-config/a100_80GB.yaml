@@ -13,9 +13,8 @@ sw_param:
     # Each field accepts: numeric byte counts, dtype strings (fp8/fp16/bf16/fp32), or "as_tensor_format"
     kv_cache: as_tensor_format # KV cache precision. WIP - currently ignored.
     parameters: as_tensor_format  # Model parameter precision
-    gradients: as_tensor_format  # Accumulated gradients 
-    grad_microbatch: as_tensor_format  # Ephemeral per-microbatch gradients 
-    grad_communication: as_tensor_format  # Gradient communication precision 
+    gradients: fp32  # Accumulated gradients 
+    grad_communication: fp32  # Gradient communication precision 
     optimizer_states: as_tensor_format  # Optimizer states 
     stats: as_tensor_format  # Normalization statistics 
     master_parameters: 0.0  # master weight copy in bytes (0 = disabled)
@@ -33,7 +32,7 @@ tech_param:
     FMA_d1: 8                 # tensor core can compute the results for an d1 x d2 x d1 mixed-precision matrix multiplication per clock
     FMA_d2: 4
     dataflow: best            # {wst | ast | ost | best}: wst: weight stationary, ast: activation stationary, ost: output stationary, best: best of all 3
-    util: 1.0
+    util: 1
   DRAM:
     size: 80 GB
     bandwidth: 1986 GB     # (/s)
@@ -74,46 +73,52 @@ memory_hierarchy:
     scope: global
 
 parallelism:
-  dp: 2 # data parallelism. Acts as replica count during inference
   tp: 2 # tensor parallelism
   tp_sp: true # tensor-sequence parallelism
   cp: 1 # context parallelism. Not supported for inference.
-  lp: 4 # pipeline parallelism. Number of pipeline stages
+  pp: 1 # pipeline parallelism. Number of pipeline stages
   # mb is not a true parallelism parameter, does not affect num of GPUs.
-  mb: 4 # micro-batches (for best results set to >= lp). 
+  mb: 1 # micro-batches (for best results set to >= pp).
 
+  train:
+    dp: 1 # data parallelism
+    ep: 1 # expert parallelism
+    # controls expert TP sharding: if false, tp and ep are applied separately to attn/FFN; if true, TP applies to both
+    tp_ep: true
+  inference:
+    replica_count: 1 # inference throughput scaling only
+    moe_dp: 1 # inference expert pool expansion (EP_eff = tp * moe_dp)
 network:
   overlap:
-    tp_overlap: 0.63
-    tp_sp_overlap: 0.6
+    tp_overlap: 0.0
+    tp_sp_overlap: 0.0
     cp_overlap: 0.0
   # Global faulty links apply to the active AstraSim dimension: [[src, dst, weight]]
   # faulty_links: [[0,1,0.6],[16,17,0.1]]
   dimensions:
-    # currently only support astrasim integration with all devices in one node.
     - id: dim0
       label: torus2d_tp
       size: auto
       topology:
-        type: Ring
-        bandwidth: 100 GB # We assume 8 25GB/s NVLINKs in the torus. Torus2D is hardcoded bidirectional, so it's actually 4 links, 25GB/s each (because they get replicated). So 100GB/s total. 
+        type: Torus2D
+        bandwidth: 50 GB # We assume 8 25GB/s NVLINKs in the torus. Torus2D is hardcoded bidirectional, so it's actually 4 links, 25GB/s each (because they get replicated). So 100GB/s total. 
         latency: 5e-6
         energy_per_bit: 8e-12 # (J/bit)
         util: 1.0
         optimize_2dmap: false
       collective_override: {} # overrides execution_backend.collectives when provided
-      parallelisms: [tp, cp]
+      parallelisms: [tp, cp, ep]
     - id: dim1
       label: inter_torus_infiniband
       size: auto
       topology:
         type: Ring 
-        bandwidth: 25 GB # SPLIT INTO BW_PER_GPU, BW_TOTAL. BW TOTAL IS ONLY ALLOWED IF PREV DIM is 2D.
+        bandwidth: 20 GB # SPLIT INTO BW_PER_GPU, BW_TOTAL. BW TOTAL IS ONLY ALLOWED IF PREV DIM is 2D.
         latency: 5e-6
         energy_per_bit: 8e-12 # (J/bit)
         util: 1.0
       collective_override: {} # overrides execution_backend.collectives when provided
-      parallelisms: [lp,dp]
+      parallelisms: [pp,dp]
     - id: dim2
       label: inter_torus_infiniband_dp
       size: auto

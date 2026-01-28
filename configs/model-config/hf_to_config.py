@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# Copyright 2026 NanoCad lab, UCLA
+# https://nanocad.ee.ucla.edu/
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Convert a Hugging Face transformer config.json into a RAPID-LLM LLM YAML config."""
 
 import argparse
@@ -41,10 +56,14 @@ def _infer_model_type(model_type_field: Optional[str]) -> Tuple[str, Optional[st
         return "gpt", alias
     lowered = model_type_field.lower()
     normalized = lowered.replace("-", "").replace("_", "")
+    if "glm" in normalized:
+        return "glm4_moe", "glm"
     if "qwen2" in normalized:
         return "llama", "qwen2"
     if "phi3" in normalized:
         return "llama", "phi3"
+    if "deepseek" in normalized:
+        return "llama", "deepseek"
     if "llama" in lowered:
         return "llama", alias
     if "gpt" in lowered or "opt" in lowered or "mpt" in lowered:
@@ -73,6 +92,22 @@ def _build_yaml_config(cfg: dict, args: argparse.Namespace, model_type: str) -> 
 
     lang_cfg = cfg.get("language_config", {})
 
+    head_dim = _first(
+        cfg,
+        "head_dim",
+        "attention_head_dim",
+        "head_size",
+        "kv_channels",
+        default=_first(
+            lang_cfg,
+            "head_dim",
+            "attention_head_dim",
+            "head_size",
+            "kv_channels",
+            default=None,
+        ),
+    )
+
     kv_heads = _first(
         cfg,
         "num_key_value_heads",
@@ -97,6 +132,18 @@ def _build_yaml_config(cfg: dict, args: argparse.Namespace, model_type: str) -> 
         attention_block["kv_heads"] = int(kv_heads)
     else:
         attention_block["kv_heads"] = None
+
+    if model_type == "glm4_moe":
+        if head_dim is None:
+            raise SystemExit(
+                "Unable to deduce head_dim for model_type 'glm4_moe' from config.json."
+            )
+        try:
+            attention_block["head_dim"] = int(head_dim)
+        except (TypeError, ValueError):
+            raise SystemExit(
+                f"Invalid head_dim value for model_type 'glm4_moe': {head_dim!r}."
+            )
 
     use_flashattention = args.use_flashattention
     if use_flashattention is None:
@@ -159,6 +206,16 @@ def _build_yaml_config(cfg: dict, args: argparse.Namespace, model_type: str) -> 
 
     intermediate_size_value = int(intermediate_size) if intermediate_size is not None else 4 * int(hidden_dim)
 
+    moe_intermediate_size = _first(
+        cfg,
+        "moe_intermediate_size",
+        default=_first(lang_cfg, "moe_intermediate_size", default=intermediate_size_value),
+    )
+    try:
+        moe_intermediate_size_value = int(moe_intermediate_size)
+    except (TypeError, ValueError):
+        moe_intermediate_size_value = intermediate_size_value
+
     num_experts = _first(
         cfg,
         "num_local_experts",
@@ -199,6 +256,41 @@ def _build_yaml_config(cfg: dict, args: argparse.Namespace, model_type: str) -> 
     except (TypeError, ValueError):
         top_k_value = 1
     top_k_value = min(top_k_value, num_experts_value)
+    n_shared_experts = _first(
+        cfg,
+        "n_shared_experts",
+        "num_shared_experts",
+        default=_first(lang_cfg, "n_shared_experts", "num_shared_experts", default=0),
+    )
+    try:
+        n_shared_experts_value = max(0, int(n_shared_experts))
+    except (TypeError, ValueError):
+        n_shared_experts_value = 0
+
+    moe_layer_freq = _first(
+        cfg,
+        "moe_layer_freq",
+        "moe_layer_frequency",
+        default=_first(lang_cfg, "moe_layer_freq", "moe_layer_frequency", default=1),
+    )
+    try:
+        moe_layer_freq = int(moe_layer_freq)
+    except (TypeError, ValueError):
+        moe_layer_freq = 1
+
+    first_k_dense_replace = _first(
+        cfg,
+        "first_k_dense_replace",
+        "first_k_dense_layers",
+        default=_first(lang_cfg, "first_k_dense_replace", "first_k_dense_layers", default=0),
+    )
+    try:
+        first_k_dense_replace = int(first_k_dense_replace)
+    except (TypeError, ValueError):
+        first_k_dense_replace = 0
+    if num_experts_value <= 1:
+        # Default to dense-only when MoE parameters are disabled.
+        first_k_dense_replace = int(num_layers)
 
     yaml_dict = {
         "model_param": {
@@ -213,8 +305,14 @@ def _build_yaml_config(cfg: dict, args: argparse.Namespace, model_type: str) -> 
             "hidden_dim": int(hidden_dim),
             "attention": attention_block,
             "intermediate_size": intermediate_size_value,
-            "num_experts": num_experts_value,
-            "top_k": top_k_value,
+            "moe": {
+                "num_experts": num_experts_value,
+                "top_k": top_k_value,
+                "moe_intermediate_size": moe_intermediate_size_value,
+                "n_shared_experts": n_shared_experts_value,
+                "moe_layer_freq": moe_layer_freq,
+                "first_k_dense_replace": first_k_dense_replace,
+            },
             "vocab_size": int(vocab_size),
             "num_layers": int(num_layers),
         },
@@ -274,7 +372,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         sys.stdout.write(yaml_dump)
 
     if alias:
-        print(f"[INFO] Mapping Hugging Face model_type '{orig_model_type}' to RAPID-LLM model_type 'llama'.")
+        print(
+            f"[INFO] Mapping Hugging Face model_type '{orig_model_type}' to RAPID-LLM model_type '{inferred_model_type}'."
+        )
 
     lang_cfg = cfg.get("language_config", {})
     if alias == "phi3":

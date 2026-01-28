@@ -1,10 +1,26 @@
+# Copyright 2026 NanoCad lab, UCLA
+# https://nanocad.ee.ucla.edu/
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import math
 import os
 import sys
 import config
 import shutil
 import itertools
-from typing import NamedTuple, Optional
+from dataclasses import replace
+from typing import Dict, NamedTuple, Optional
 
 import util
 from hw_component import Core, MemoryHierarchy, Network, DRAM
@@ -18,14 +34,72 @@ class LinkInfo(NamedTuple):
     latency: float
 
 
+def _active_axis_sizes(hw_config, run_type: str) -> Dict[str, int]:
+    sch = getattr(hw_config, "sch_config", None)
+    if sch is None:
+        return {"tp": 1, "cp": 1, "ep": 1, "pp": 1, "dp": 1}
+    normalized = str(run_type or "training").lower()
+    if normalized == "inference":
+        dp = 1
+        ep = int(sch.inference.moe_dp)
+    else:
+        dp = int(sch.train.dp)
+        ep = int(sch.train.ep)
+    return {
+        "tp": int(sch.tp),
+        "cp": int(sch.cp),
+        "ep": ep,
+        "pp": int(sch.pp),
+        "dp": dp,
+    }
+
+
+def _refresh_network_layout(hw_config, axis_sizes: Dict[str, int]):
+    layout = getattr(hw_config, "network_layout", None)
+    if layout is None or not getattr(layout, "dimensions", None):
+        return layout
+    dimensions = []
+    for dim in layout.dimensions:
+        axes = [str(axis).strip().lower() for axis in getattr(dim, "parallelisms", ()) or ()]
+        if not axes:
+            dimensions.append(dim)
+            continue
+        expected = 1
+        for axis in axes:
+            expected *= max(1, int(axis_sizes.get(axis, 1)))
+        size_value = int(getattr(dim, "size", expected) or expected)
+        if expected != size_value:
+            dimensions.append(replace(dim, size=expected))
+        else:
+            dimensions.append(dim)
+    return config._build_network_layout_config(
+        dimensions,
+        getattr(layout, "faulty_links", ()) or (),
+        getattr(layout, "overlap_config", None),
+    )
+
+
 class Parallelism:
-    def __init__(self, exp_config):
-        self.lp = exp_config.sch_config.lp
-        self.mb = exp_config.sch_config.mb
-        self.dp = exp_config.sch_config.dp
-        self.tp = exp_config.sch_config.tp
-        self.cp = exp_config.sch_config.cp
-        self.tp_sp = exp_config.sch_config.tp_sp
+    def __init__(self, exp_config, run_type: str = "training"):
+        sch = exp_config.sch_config
+        self.pp = sch.pp
+        self.mb = sch.mb
+        self.tp = sch.tp
+        self.cp = sch.cp
+        self.tp_sp = sch.tp_sp
+        self.run_type = str(run_type or "training").lower()
+        if self.run_type == "inference":
+            self.dp = 1
+            self.ep = int(sch.inference.moe_dp)
+            self.tp_ep = False
+            self.replica_count = int(sch.inference.replica_count)
+            self.moe_dp = int(sch.inference.moe_dp)
+        else:
+            self.dp = int(sch.train.dp)
+            self.ep = int(sch.train.ep)
+            self.tp_ep = bool(sch.train.tp_ep)
+            self.replica_count = 1
+            self.moe_dp = 1
 
 
 class model_GEMM:
@@ -47,6 +121,7 @@ class model_LLM:
         self.seq_len = exp_config.model_config.seq_len
         self.decode_len = exp_config.model_config.decode_len
         self.num_heads = exp_config.model_config.num_heads
+        self.head_dim = getattr(exp_config.model_config, "head_dim", None)
         self.tied_embeddings = exp_config.model_config.tied_embeddings
         self.model_type = exp_config.model_config.model_type
         self.intermediate_size = exp_config.model_config.intermediate_size
@@ -63,7 +138,14 @@ class model_LLM:
 
         self.moe_num_experts = int(getattr(exp_config.model_config, "num_experts", 1))
         self.moe_top_k = int(getattr(exp_config.model_config, "top_k", 1))
-        self.use_moe = self.moe_num_experts > 1
+        self.moe_intermediate_size = int(
+            getattr(exp_config.model_config, "moe_intermediate_size", self.intermediate_size)
+        )
+        self.n_shared_experts = int(getattr(exp_config.model_config, "n_shared_experts", 0))
+        self.moe_layer_freq = int(getattr(exp_config.model_config, "moe_layer_freq", 1))
+        self.first_k_dense_replace = int(getattr(exp_config.model_config, "first_k_dense_replace", 0))
+        self.moe_layer_mask = list(getattr(exp_config.model_config, "moe_layer_mask", []))
+        self.use_moe = bool(getattr(exp_config.model_config, "use_moe", False))
 
         inference_cfg = getattr(exp_config, "inference_config", None)
         if str(self.run_type).lower() == "inference":
@@ -270,6 +352,18 @@ class TimeCalculation:
         self.grad_acc_overhead = float(getattr(hw_config.sw_config, "grad_acc_overhead", 0.0) or 0.0)
         self.attached = True
 
+        run_type = "training"
+        if str(mode).upper() == "LLM":
+            model_cfg = getattr(model_config, "model_config", None)
+            run_type = str(getattr(model_cfg, "run_type", "training")).lower()
+        self.run_type = run_type
+
+        axis_sizes = _active_axis_sizes(hw_config, run_type)
+        setattr(hw_config, "active_parallelism", dict(axis_sizes))
+        refreshed_layout = _refresh_network_layout(hw_config, axis_sizes)
+        if refreshed_layout is not None:
+            hw_config.network_layout = refreshed_layout
+
         # Hardware Parameters
         self.hw_config = hw_config
         self.core = Core(hw_config)
@@ -282,7 +376,6 @@ class TimeCalculation:
         self.mem_layer = self.memory_hierarchy.mem_layer
         self.tile_space = None
         self.H2Dbw = self.h2d_bandwidth
-        self.num_workers = self._derive_num_workers(hw_config)
 
         level = 0
         mem_config = hw_config.memory_hierarchy.mem_hr[level]
@@ -291,22 +384,28 @@ class TimeCalculation:
 
         self.links = {
             "dp": LinkInfo(*self.network.get_link("dp")),
-            "lp": LinkInfo(*self.network.get_link("lp")),
+            "ep": LinkInfo(*self.network.get_link("ep")),
+            "pp": LinkInfo(*self.network.get_link("pp")),
             "tp": LinkInfo(*self.network.get_link("tp")),
             "cp": LinkInfo(*self.network.get_link("cp")),
         }
         
         # Scheduling Parameters
-        par = Parallelism(hw_config)
+        par = Parallelism(hw_config, run_type=run_type)
         self.mode = mode
-        self.lp = par.lp
+        self.pp = par.pp
         self.mb = par.mb
         self.dp = par.dp
+        self.ep = par.ep
 
         self.tp = par.tp
         self.cp = par.cp
 
         self.tp_sp = par.tp_sp
+        self.tp_ep = par.tp_ep
+        self.replica_count = par.replica_count
+        self.moe_dp = par.moe_dp
+        self.num_workers = self._derive_num_workers(hw_config)
 
         
         # Statistics Param
@@ -347,10 +446,19 @@ class TimeCalculation:
             self.hidden_dim = self.model.hidden_dim
             self.seq_len = self.model.seq_len
             self.num_heads = self.model.num_heads
+            self.head_dim = (
+                int(self.model.head_dim)
+                if getattr(self.model, "head_dim", None) is not None
+                else self.hidden_dim // self.num_heads
+            )
             self.intermediate_size = self.model.intermediate_size
             self.n_tokens = self.model.n_tokens
-            self.mini_batch = math.ceil(self.batch_size / self.dp)  # mini-batch size for each data parallel node
-            self.micro_batch = math.ceil(self.mini_batch / self.mb) if self.lp > 1 else self.mini_batch
+            if self.run_type == "inference":
+                dp_dense = 1
+            else:
+                dp_dense = self.dp * self.ep if bool(getattr(self.model, "use_moe", False)) else self.dp
+            self.mini_batch = math.ceil(self.batch_size / dp_dense)  # mini-batch size for each data parallel node
+            self.micro_batch = math.ceil(self.mini_batch / self.mb) if self.pp > 1 else self.mini_batch
             self.attention_type = self.model.attention_type
             self.flash_attention = getattr(self.model, "use_flashattention", False)
             self.kv_heads = self.model.kv_heads if hasattr(self.model, "kv_heads") else self.num_heads
@@ -359,7 +467,15 @@ class TimeCalculation:
             raw_top_k = getattr(self.model, "moe_top_k", 1)
             self.moe_num_experts = max(1, int(raw_num_experts))
             self.moe_top_k = max(1, int(raw_top_k))
-            self.use_moe = self.moe_num_experts > 1
+            self.moe_intermediate_size = int(
+                getattr(self.model, "moe_intermediate_size", self.intermediate_size)
+            )
+            self.n_shared_experts = int(getattr(self.model, "n_shared_experts", 0))
+            self.moe_layer_freq = int(getattr(self.model, "moe_layer_freq", 1))
+            self.first_k_dense_replace = int(getattr(self.model, "first_k_dense_replace", 0))
+            self.moe_layer_mask = list(getattr(self.model, "moe_layer_mask", []))
+            self.use_moe = bool(getattr(self.model, "use_moe", False))
+            self.num_moe_layers = sum(self.moe_layer_mask)
 
 
     def _derive_num_workers(self, hw_config) -> int:
@@ -377,19 +493,23 @@ class TimeCalculation:
             if total >= 1:
                 return int(total)
 
-        factors = []
-        for name in ("dp", "lp", "tp", "cp"):
-            value = getattr(hw_config.sch_config, name, 1)
-            try:
-                factor = int(value) if value else 1
-            except (TypeError, ValueError):
-                factor = 1
-            if factor < 1:
-                factor = 1
-            factors.append(factor)
-        total = 1
-        for factor in factors:
-            total *= factor
+        active = getattr(hw_config, "active_parallelism", None)
+        if isinstance(active, dict) and active:
+            total = 1
+            for axis in ("dp", "pp", "tp", "cp", "ep"):
+                total *= max(1, int(active.get(axis, 1) or 1))
+            return max(1, total)
+
+        sch = getattr(hw_config, "sch_config", None)
+        if sch is None:
+            return 1
+        total = (
+            max(1, int(sch.train.dp))
+            * max(1, int(sch.train.ep))
+            * max(1, int(sch.pp))
+            * max(1, int(sch.tp))
+            * max(1, int(sch.cp))
+        )
         return max(1, total)
    
 
